@@ -238,7 +238,40 @@ INSTALLER
         echo "#   by lineage. Unrelated writes elsewhere on the machine"
         echo "#   must NOT appear."
         echo "############################################################"
-        "$BIN/chronicle" --db "$GRAPH" trace -- sh "$LAB/fake-install.sh" "$LAB/live"
+        TRACE_OUT="$("$BIN/chronicle" --db "$GRAPH" trace -- sh "$LAB/fake-install.sh" "$LAB/live" 2>&1)"
+        echo "$TRACE_OUT"
+        TPID="$(printf '%s' "$TRACE_OUT" | grep -oE 'pid [0-9]+' | head -1 | awk '{print $2}')"
+
+        # ---- revert --------------------------------------------------
+        # The whole point, end to end: undo exactly what that command did
+        # and nothing else. Dry run first -- this deletes and overwrites
+        # files, so seeing the plan before it runs is the default.
+        if [ -n "$TPID" ]; then
+            echo
+            echo "############################################################"
+            echo "# chronicle revert $TPID   (dry run — changes nothing)"
+            echo "############################################################"
+            "$BIN/chronicle" --db "$GRAPH" revert "$TPID" \
+                --snap "$LAB/snap" --live "$LAB/live"
+
+            echo
+            echo "== files the installer created, before undo =="
+            ls "$LAB/live" 2>/dev/null
+
+            echo
+            echo "############################################################"
+            echo "# chronicle revert $TPID --apply"
+            echo "############################################################"
+            "$BIN/chronicle" --db "$GRAPH" revert "$TPID" \
+                --snap "$LAB/snap" --live "$LAB/live" --apply
+
+            echo
+            echo "== after undo: the installer's files should be gone, =="
+            echo "==            nginx.conf should still be here        =="
+            ls "$LAB/live" 2>/dev/null
+        else
+            echo "could not determine traced pid — skipping revert"
+        fi
     fi
 fi
 

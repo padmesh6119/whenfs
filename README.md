@@ -62,7 +62,47 @@ See `../ARCHITECTURE.md` for the full design and rationale.
     explaining why that process existed*.
   - `log <path>` — full per-file history.
   - `tree <pid>` — every process descended from one.
+  - `revert <pid>` — undo a traced command: restore each path it touched
+    from the newest snapshot predating the command, and delete what it
+    created. **Dry run unless `--apply`.** Refuses package-manager state
+    (restoring files under dpkg/xbps leaves its database confidently wrong
+    — that has to be undone *through* the package manager) and refuses
+    anything outside the snapshotted tree, where a missing pre-image would
+    otherwise be "restored" by deletion.
   - `stat` — graph size.
+
+## Undo
+
+```
+$ chronicle trace -- sh install.sh
+traced sh install.sh  exit 0, 0.3s, pid 4821
+  5 paths touched by 4 processes
+  ...
+
+$ chronicle revert 4821 --snap /snap --live /home
+dry run — undo plan for pid 4821
+
+  restore  /home/app/config.toml   from 2026-08-20T09-14-00
+  remove   /home/app/new-binary    (created by this command)
+  skip     /var/lib/dpkg/status    — package manager state
+  skip     /etc/hosts              — outside the snapshotted tree
+
+  1 to restore, 1 to remove, 2 skipped
+  dry run: nothing was changed. Re-run with --apply.
+```
+
+Only filesystem state. A command that sent a packet or charged a card is
+not undone by any of this. Within the filesystem the model is: for each
+path touched, restore whatever the newest snapshot *before* the command
+holds — and if it holds no such file, the command created it, so removing
+it is the restoration.
+
+The pre-image is the snapshot before the **first** touch, not the last: a
+command that writes a file repeatedly must be undone to its state before
+the command began, not to some intermediate value the command produced.
+
+Re-applying is safe — a file already removed is the desired end state, not
+an error.
 - `snapshot.sh` — three interchangeable backends via `SNAPSHOT_MODE`, all
   live-verified: `hardlink` (default, `cp -al`, any filesystem, no
   privilege), `full` (`cp -a`, real independent copy, small trees only),

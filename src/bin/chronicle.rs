@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use whenfs::graph::{FileEvent, Graph};
+use whenfs::revert::{self, Step};
 
 const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
@@ -247,10 +248,11 @@ fn cmd_trace(g: &Graph, argv: &[String]) {
         Err(e) => format!("wait failed: {e}"),
     };
     println!(
-        "\n{BOLD}traced{RESET} {}  {DIM}exit {}, {:.1}s{RESET}",
+        "\n{BOLD}traced{RESET} {}  {DIM}exit {}, {:.1}s, pid {}{RESET}",
         argv.join(" "),
         code,
-        elapsed.as_secs_f32()
+        elapsed.as_secs_f32(),
+        pid
     );
 
     let Some(start) = start_ts else {
@@ -302,6 +304,123 @@ fn cmd_trace(g: &Graph, argv: &[String]) {
         let w = by.get(path).cloned().unwrap_or_default();
         println!("  {CYAN}{:<22}{RESET} {}  {DIM}{}{RESET}", o, path, w);
     }
+    println!("\n  {DIM}undo:  chronicle revert {pid} --snap <dir> --live <dir>{RESET}");
+}
+
+/// Undo a traced command's writes.
+///
+/// Dry run unless `--apply` is passed. That default is not politeness: this
+/// deletes and overwrites files, the plan is derived from a graph that has
+/// already been wrong in five distinct ways this project has had to find,
+/// and a plan that looks wrong is far cheaper to read than to recover from.
+fn cmd_revert(g: &Graph, pid_arg: &str, snap_root: &Path, live_root: &Path, apply: bool) {
+    let Ok(pid) = pid_arg.parse::<i32>() else {
+        eprintln!("not a pid: {pid_arg}");
+        return;
+    };
+    let Ok(Some(start)) = g.latest_start_ts(pid) else {
+        eprintln!("no process recorded with pid {pid}");
+        return;
+    };
+    let events = match g.events_by_tree(pid, &start) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("query failed: {e}");
+            return;
+        }
+    };
+    if events.is_empty() {
+        println!("nothing recorded for pid {pid} — nothing to undo");
+        return;
+    }
+
+    let mut snapshots: Vec<String> = std::fs::read_dir(snap_root)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    snapshots.sort();
+    if snapshots.is_empty() {
+        eprintln!(
+            "no snapshots under {} — nothing to restore from",
+            snap_root.display()
+        );
+        return;
+    }
+
+    let steps = revert::plan(&events, &snapshots, snap_root, live_root);
+
+    let (mut restores, mut removes, mut skips) = (0, 0, 0);
+    println!(
+        "\n{BOLD}{}{RESET} undo plan for pid {pid}\n",
+        if apply { "applying" } else { "dry run —" }
+    );
+    for st in &steps {
+        match st {
+            Step::Restore { path, from } => {
+                restores += 1;
+                let snap = from
+                    .strip_prefix(snap_root)
+                    .ok()
+                    .and_then(|p| {
+                        p.components()
+                            .next()
+                            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    })
+                    .unwrap_or_default();
+                println!(
+                    "  {CYAN}restore{RESET}  {}  {DIM}from {}{RESET}",
+                    path.display(),
+                    snap
+                );
+            }
+            Step::Remove { path } => {
+                removes += 1;
+                println!(
+                    "  {YELLOW}remove {RESET}  {}  {DIM}(created by this command){RESET}",
+                    path.display()
+                );
+            }
+            Step::Skip { path, why } => {
+                skips += 1;
+                println!("  {DIM}skip    {}  — {}{RESET}", path.display(), why);
+            }
+        }
+    }
+    println!("\n  {restores} to restore, {removes} to remove, {skips} skipped");
+
+    if !apply {
+        println!("  {DIM}dry run: nothing was changed. Re-run with --apply.{RESET}");
+        return;
+    }
+
+    let (mut ok, mut failed) = (0, 0);
+    for st in &steps {
+        let r = match st {
+            Step::Restore { path, from } => path
+                .parent()
+                .map(std::fs::create_dir_all)
+                .unwrap_or(Ok(()))
+                .and_then(|_| std::fs::copy(from, path).map(|_| ())),
+            Step::Remove { path } => match std::fs::remove_file(path) {
+                // Already gone is the desired end state, not a failure.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+            Step::Skip { .. } => continue,
+        };
+        match r {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("  {YELLOW}failed{RESET} {}: {e}", st.path().display());
+            }
+        }
+    }
+    println!("  {ok} applied, {failed} failed");
 }
 
 fn cmd_stat(g: &Graph, db: &Path) {
@@ -322,6 +441,8 @@ fn usage() -> ! {
   chronicle blame <path>     who last wrote it, and why
   chronicle tree  <pid>      everything a process tree touched
   chronicle trace -- <cmd>   run a command, report every file it touched
+  chronicle revert <pid>     undo a traced command (dry run unless --apply)
+                             needs --snap <dir> --live <dir>
   chronicle stat             graph size
 
   --db <path>                database location
@@ -335,15 +456,40 @@ fn main() {
     let argv: Vec<String> = env::args().collect();
 
     let mut db_arg: Option<String> = None;
+    let mut snap_arg: Option<String> = None;
+    let mut live_arg: Option<String> = None;
+    let mut apply = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 1;
     while i < argv.len() {
-        if argv[i] == "--db" && i + 1 < argv.len() {
-            db_arg = Some(argv[i + 1].clone());
-            i += 2;
-        } else {
+        // Everything after `trace` belongs to the traced command, so its
+        // flags must never be eaten as ours.
+        if rest.first().map(String::as_str) == Some("trace") {
             rest.push(argv[i].clone());
             i += 1;
+            continue;
+        }
+        match argv[i].as_str() {
+            "--db" if i + 1 < argv.len() => {
+                db_arg = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--snap" if i + 1 < argv.len() => {
+                snap_arg = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--live" if i + 1 < argv.len() => {
+                live_arg = Some(argv[i + 1].clone());
+                i += 2;
+            }
+            "--apply" => {
+                apply = true;
+                i += 1;
+            }
+            _ => {
+                rest.push(argv[i].clone());
+                i += 1;
+            }
         }
     }
 
@@ -375,6 +521,13 @@ Looked for: $WHENFS_GRAPH, ./graph.db, /var/lib/whenfs/graph.db"
         ("blame", 2) => cmd_blame(&g, &rest[1]),
         ("tree", 2) => cmd_tree(&g, &rest[1]),
         ("stat", 1) => cmd_stat(&g, &db),
+        ("revert", 2) => {
+            let (Some(snap), Some(live)) = (snap_arg.as_deref(), live_arg.as_deref()) else {
+                eprintln!("revert needs --snap <snapshot-dir> --live <watched-dir>");
+                std::process::exit(1);
+            };
+            cmd_revert(&g, &rest[1], Path::new(snap), Path::new(live), apply);
+        }
         ("trace", n) if n >= 2 => {
             // Everything after `trace` (and an optional `--`) is the
             // command, so its own flags are never parsed as ours.
