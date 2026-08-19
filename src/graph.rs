@@ -299,15 +299,39 @@ impl Graph {
     /// Full history of one path, oldest first.
     pub fn log_file(&self, path: &str) -> rusqlite::Result<Vec<FileEvent>> {
         let conn = self.conn.lock().unwrap();
+        // Resolve the writer at QUERY time, not record time.
+        //
+        // Binding eagerly in record_event races the connector: fanotify and
+        // netlink are separate sockets on separate threads, and a process
+        // that forks, writes and exits in microseconds can have its write
+        // processed before its fork message is even read -- so proc_start is
+        // NULL for exactly the short-lived processes worth identifying. A
+        // live run showed this: the writing `cp` was present in `processes`
+        // with the right parent, while its own events pointed at nothing.
+        //
+        // By query time both streams have long since settled, so falling
+        // back to a window match recovers them. The stored proc_start is
+        // still preferred when present -- it was correct when it was
+        // written, and trusting it keeps this cheap in the common case.
         let mut stmt = conn.prepare(
-            "SELECT e.ts, e.path, e.op, e.pid,
+            "WITH resolved AS (
+               SELECT e.id, e.ts, e.path, e.op, e.pid,
+                      COALESCE(e.proc_start, (
+                        SELECT MAX(p2.start_ts) FROM processes p2
+                         WHERE p2.pid = e.pid
+                           AND p2.start_ts <= e.ts
+                           AND (p2.exit_ts IS NULL OR p2.exit_ts >= e.ts)
+                      )) AS rstart
+                 FROM events e
+                WHERE e.path = ?1
+             )
+             SELECT r.ts, r.path, r.op, r.pid,
                     COALESCE(p.comm, ''), COALESCE(p.exe, ''), COALESCE(p.cmdline, ''),
-                    e.proc_start
-             FROM events e
-             LEFT JOIN processes p
-               ON p.pid = e.pid AND p.start_ts = e.proc_start
-             WHERE e.path = ?1
-             ORDER BY e.ts ASC, e.id ASC",
+                    r.rstart
+               FROM resolved r
+               LEFT JOIN processes p
+                 ON p.pid = r.pid AND p.start_ts = r.rstart
+              ORDER BY r.ts ASC, r.id ASC",
         )?;
         let rows = stmt.query_map(params![path], |r| {
             Ok(FileEvent {
@@ -340,9 +364,17 @@ impl Graph {
                 SELECT pid, start_ts, ppid, exe, comm, cmdline, 0
                   FROM processes WHERE pid = ?1 AND start_ts = ?2
                 UNION ALL
+                -- Match the parent incarnation whose lifetime contained the
+                -- child's birth. Filtering on `exit_ts IS NULL` here (the
+                -- original form) truncated the chain at the first ancestor
+                -- that had since exited -- which, walking up from a
+                -- short-lived process, is usually the very first hop.
                 SELECT p.pid, p.start_ts, p.ppid, p.exe, p.comm, p.cmdline, c.depth + 1
                   FROM processes p
-                  JOIN chain c ON p.pid = c.ppid AND p.exit_ts IS NULL
+                  JOIN chain c
+                    ON p.pid = c.ppid
+                   AND p.start_ts <= c.start_ts
+                   AND (p.exit_ts IS NULL OR p.exit_ts >= c.start_ts)
                  WHERE c.depth < 64
             )
             SELECT pid, start_ts, ppid, exe, comm, cmdline FROM chain ORDER BY depth ASC
@@ -412,10 +444,16 @@ impl Graph {
             )
             SELECT e.ts, e.path, e.op, e.pid,
                    COALESCE(p.comm, ''), COALESCE(p.exe, ''), COALESCE(p.cmdline, ''),
-                   e.proc_start
+                   t.start_ts
               FROM events e
-              JOIN tree t ON e.pid = t.pid AND e.proc_start = t.start_ts
-              LEFT JOIN processes p ON p.pid = e.pid AND p.start_ts = e.proc_start
+              -- Same lazy resolution as log_file: match the event against
+              -- the incarnation's window rather than requiring the eager
+              -- binding to have won its race.
+              JOIN tree t
+                ON e.pid = t.pid
+               AND (e.proc_start = t.start_ts
+                    OR (e.proc_start IS NULL AND t.start_ts <= e.ts))
+              LEFT JOIN processes p ON p.pid = t.pid AND p.start_ts = t.start_ts
              ORDER BY e.ts ASC, e.id ASC
             "#,
         )?;
@@ -562,6 +600,69 @@ mod tests {
         g.record_existing(400, Some(1), id, boot).unwrap();
         let (procs, _) = g.counts().unwrap();
         assert_eq!(procs, 1);
+    }
+
+    #[test]
+    fn write_processed_before_its_fork_message_is_still_attributed() {
+        // The live regression. fanotify and the netlink connector are
+        // separate sockets on separate threads, so the write can be
+        // processed before the fork that created its writer is even read.
+        // Eager binding leaves proc_start NULL for precisely the
+        // short-lived processes worth naming; query-time resolution has
+        // both streams settled and recovers them.
+        let g = mem_graph();
+
+        // Event arrives FIRST -- no process row exists yet.
+        g.record_event("/tmp/raced", "create", 800).unwrap();
+        assert!(
+            g.log_file("/tmp/raced").unwrap()[0].proc_start.is_none(),
+            "precondition: eager binding found nothing"
+        );
+
+        // The connector catches up afterwards.
+        g.record_fork(1, 800).unwrap();
+        g.record_exec(800, "/bin/cp", "cp", "cp a b", 1000).unwrap();
+        g.record_exit(800).unwrap();
+
+        let log = g.log_file("/tmp/raced").unwrap();
+        assert_eq!(log[0].comm, "cp", "query-time resolution must recover it");
+        assert!(log[0].proc_start.is_some());
+    }
+
+    #[test]
+    fn ancestry_walks_through_ancestors_that_have_already_exited() {
+        // Walking up from a short-lived process, the first hop is usually
+        // an ancestor that has itself exited. Filtering the recursive join
+        // on liveness truncated the chain immediately.
+        let g = mem_graph();
+        g.record_fork(1, 10).unwrap();
+        g.record_exec(10, "/bin/bash", "bash", "bash run.sh", 1000)
+            .unwrap();
+        g.record_fork(10, 20).unwrap();
+        g.record_exec(20, "/bin/sh", "sh", "sh -c cp", 1000)
+            .unwrap();
+        g.record_fork(20, 30).unwrap();
+        g.record_exec(30, "/bin/cp", "cp", "cp a b", 1000).unwrap();
+
+        // Every ancestor exits before the query runs.
+        g.record_exit(30).unwrap();
+        g.record_exit(20).unwrap();
+        g.record_exit(10).unwrap();
+
+        let start = g.live_start_ts(30).unwrap().unwrap_or_else(|| {
+            let conn = g.conn.lock().unwrap();
+            conn.query_row("SELECT start_ts FROM processes WHERE pid=30", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        });
+        let chain: Vec<String> = g
+            .ancestry(30, &start)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.comm)
+            .collect();
+        assert_eq!(chain, vec!["cp", "sh", "bash"]);
     }
 
     #[test]

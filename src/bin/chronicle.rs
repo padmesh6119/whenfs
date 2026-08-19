@@ -44,13 +44,21 @@ fn normalize(path: &str) -> String {
 
 fn who(e: &FileEvent) -> String {
     if !e.comm.is_empty() {
-        e.comm.clone()
-    } else if !e.exe.is_empty() {
-        e.exe.clone()
+        return e.comm.clone();
+    }
+    if !e.exe.is_empty() {
+        return e.exe.clone();
+    }
+    // Two different failures, worth distinguishing rather than collapsing
+    // into one word. Either is shown loudly rather than left blank, because
+    // a write nobody can account for is exactly the interesting case.
+    if e.proc_start.is_some() {
+        // The process is known -- it has a row, a parent, a place in the
+        // tree -- but it exited before /proc could be read for its name.
+        // Its ancestry still explains the write.
+        format!("{YELLOW}<unnamed>{RESET}")
     } else {
-        // A hole in the graph — the writer was gone before it could be
-        // identified. Shown as unknown rather than quietly blank, because
-        // an unattributed write is exactly the interesting case.
+        // No process at all: nothing in the graph accounts for this write.
         format!("{YELLOW}<unattributed>{RESET}")
     }
 }
@@ -124,11 +132,13 @@ fn cmd_blame(g: &Graph, path: &str) {
                     }
                 })
                 .collect();
-            println!("  {DIM}because:{RESET}      {}", names.join(" ← "));
-            if let Some(root) = chain.last()
-                && !root.cmdline.is_empty()
-            {
-                println!("  {DIM}root command:{RESET} {}", root.cmdline);
+            println!("  {DIM}because:{RESET}    {}", names.join(" ← "));
+            // The chain root is always init, which explains nothing. The
+            // useful answer is the nearest ancestor that still knows what
+            // it was invoked as -- walking outward from the writer, the
+            // first one carrying a real command line.
+            if let Some(origin) = chain.iter().skip(1).find(|p| !p.cmdline.is_empty()) {
+                println!("  {DIM}started by:{RESET} {}", origin.cmdline);
             }
         }
         Ok(_) => {}

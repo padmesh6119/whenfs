@@ -131,9 +131,10 @@ Correctness properties covered by tests (`cargo test --lib`):
 
 ## Known v0 limitations
 
-- **The graph's first live run found three real bugs.** Documented here
-  because they are the useful part; all three are fixed, but the fixes
-  have not themselves been re-verified live yet.
+- **Two live runs, five real bugs.** Documented because they are the useful
+  part. The first run's fixes were confirmed against the second run's real
+  database; the second run's fixes (4 and 5 below) are verified by replaying
+  the fixed binary over that same captured data, not yet by a third run.
 
   1. *Self-write feedback loop.* The daemon writes its log and database
      inside the mount it watches, so each recorded event was itself a write
@@ -153,9 +154,37 @@ Correctness properties covered by tests (`cargo test --lib`):
      -- services, editors, browsers -- was anonymous. The daemon now seeds
      the table from `/proc` at startup.
 
-  Worth noting the unit tests passed throughout all three. They called
-  `record_event` before `record_exit`; real kernel ordering is the reverse.
-  Only live traffic exposed it.
+  4. *Eager binding raced the fork message.* `record_event` resolved the
+     writer at record time, but fanotify and the connector are separate
+     sockets on separate threads: a process that forks, writes and exits in
+     microseconds gets its write processed before its fork message is even
+     read. The writing `cp` was present in `processes` with the correct
+     parent while its own events pointed at nothing. Resolution now happens
+     at **query** time, when both streams have settled.
+  5. *Ancestry stopped at the first exited ancestor.* The recursive walk
+     joined on `exit_ts IS NULL`, so climbing from a short-lived process --
+     whose parents have usually also exited -- truncated at the first hop.
+     Now matches the parent incarnation whose lifetime contained the
+     child's birth.
+
+  Worth noting the unit tests passed throughout all five. They called
+  `record_event` before `record_exit` and before `record_fork`; real kernel
+  ordering is the reverse of both. Only live traffic exposed it.
+
+  What the fixes recovered, on the same data that previously returned
+  nothing at all:
+
+  ```
+  $ chronicle blame .../live/traced.conf
+    2026-08-20T02-02-26  create  <unnamed>  pid 16710
+    because:    pid 16710 ← pid 16709 ← bash ← zsh ← x-terminal-emul ← systemd
+    started by: bash ./demo.sh
+  ```
+
+  The two fastest processes still lost their *names* to the exit race
+  (`<unnamed>` -- known process, unknown identity, distinct from
+  `<unattributed>` where no process is known at all). Their ancestry still
+  explains the write completely.
 - **Recording every fork is untested at scale.** A busy machine forks
   constantly. Process rows are small and the edge is essential, but growth
   under real load is unmeasured -- and the one measurement taken so far was
