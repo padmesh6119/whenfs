@@ -1,0 +1,7 @@
+#!/bin/sh
+exec 2>&1
+: "${WHEN_LIVE_ROOT:=/home}"
+: "${WHEN_SNAP_ROOT:=/var/lib/whenfs/snap}"
+: "${WHEN_INTERVAL:=300}"
+mkdir -p "$WHEN_SNAP_ROOT"
+exec /usr/local/lib/whenfs/snapshot-loop.sh "$WHEN_LIVE_ROOT" "$WHEN_SNAP_ROOT" "$WHEN_INTERVAL"

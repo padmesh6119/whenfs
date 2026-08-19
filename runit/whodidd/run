@@ -1,0 +1,6 @@
+#!/bin/sh
+exec 2>&1
+: "${WHEN_LIVE_ROOT:=/home}"
+: "${WHEN_LOG_PATH:=/var/log/whodid/events.jsonl}"
+mkdir -p "$(dirname "$WHEN_LOG_PATH")"
+exec /usr/local/bin/whodidd "$WHEN_LIVE_ROOT" "$WHEN_LOG_PATH"

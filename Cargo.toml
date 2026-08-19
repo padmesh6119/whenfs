@@ -1,0 +1,9 @@
+[package]
+name = "whenfs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fuser = { version = "0.15", default-features = false }
+libc = "0.2"
+chrono = "0.4"
