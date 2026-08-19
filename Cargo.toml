@@ -7,3 +7,8 @@ edition = "2024"
 fuser = { version = "0.15", default-features = false }
 libc = "0.2"
 chrono = "0.4"
+# bundled: compile SQLite in rather than depend on the host having a dev
+# package. Keeps the xbps template free of a libsqlite3-devel makedepend
+# and keeps `cargo build` working identically on Ubuntu and inside the
+# Void masterdir.
+rusqlite = { version = "0.32", features = ["bundled"] }

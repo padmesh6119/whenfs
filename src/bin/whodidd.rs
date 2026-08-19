@@ -20,16 +20,29 @@
 //      via open_by_handle_at() + reading the /proc/self/fd/<n> magic
 //      symlink for the parent, then appending the filename.
 //
-//   3. proc_connector  — NETLINK_CONNECTOR, PROC_EVENT_EXEC/EXIT. Captures
-//      a process's exe/comm/cmdline/uid at the instant it execs (guaranteed
-//      alive then) and evicts it on exit, so log_event() can look up
-//      identity from the table instead of reading /proc/<pid> at
-//      event-processing time — which a prior live run confirmed can race a
-//      short-lived process straight into non-existence (a real `rm` lost
-//      its comm/cmdline that way; the pid itself was still captured
-//      correctly). Falls back to a direct /proc read for any pid the
-//      connector never saw exec (already running before whodidd started) —
-//      same exposure as before the connector existed, just narrower.
+//   3. proc_connector  — NETLINK_CONNECTOR, PROC_EVENT_FORK/EXEC/EXIT.
+//      Two jobs. First, identity: captures a process's exe/comm/cmdline/uid
+//      at the instant it execs (guaranteed alive then), so log_event() can
+//      look it up rather than reading /proc/<pid> at event-processing time
+//      — which a prior live run confirmed can race a short-lived process
+//      straight into non-existence (a real `rm` lost its comm/cmdline that
+//      way; the pid itself was still captured correctly). Falls back to a
+//      direct /proc read for any pid the connector never saw exec (already
+//      running before whodidd started) — same exposure as before, narrower.
+//
+//      Second, lineage: FORK gives the parent→child edge, which nothing
+//      else on the system records. That edge is what upgrades attribution
+//      into explanation — "sh wrote this" becomes "sh wrote this because
+//      you ran that install script" — and it's the primitive the whole
+//      causal graph (see whenfs::graph) is built on.
+//
+// Two sinks, by design. The JSONL log is the append-only audit trail and
+// what `whodid` reads; the SQLite graph beside it is the queryable index
+// `chronicle` reads, holding the process tree and file events as a real
+// DAG. Log plus materialised view, not duplicated state for its own sake.
+// The graph is optional: if it can't be opened the daemon degrades to the
+// previously live-verified JSONL-only behaviour rather than losing
+// attribution entirely over a storage problem.
 //
 // Known gap this does NOT close: fanotify has no rename cookie linking a
 // FAN_MOVED_FROM to its FAN_MOVED_TO the way inotify's IN_MOVED_FROM/TO
@@ -52,8 +65,10 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::mem;
 use std::os::unix::io::RawFd;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use whenfs::graph::Graph;
 
 /// Event timestamps use the exact same format as snapshot directory names
 /// (whenfs::time_expr::SNAPSHOT_FMT), Local time. This makes them directly,
@@ -147,7 +162,26 @@ struct ProcInfo {
 
 type ProcTable = Arc<Mutex<HashMap<i32, ProcInfo>>>;
 
-fn log_event(log: &mut File, path: &str, op: &str, pid: i32, table: &ProcTable) {
+/// Optional so the daemon degrades to its previous, live-verified
+/// JSONL-only behaviour if the graph database can't be opened, rather
+/// than losing attribution entirely over a storage problem.
+type SharedGraph = Option<Arc<Graph>>;
+
+fn log_event(
+    log: &mut File,
+    path: &str,
+    op: &str,
+    pid: i32,
+    table: &ProcTable,
+    graph: &SharedGraph,
+) {
+    // Two sinks, deliberately, not duplication for its own sake: the JSONL
+    // file is the append-only audit trail (proven, and what `whodid`
+    // reads), the graph is the queryable index built from it. Log plus
+    // materialised view.
+    if let Some(g) = graph.as_ref() {
+        let _ = g.record_event(path, op, pid);
+    }
     let (exe, comm, cmdline, uid) = {
         let cached = table.lock().unwrap().get(&pid).cloned();
         match cached {
@@ -200,7 +234,7 @@ fn fanotify_init_or_die(flags: libc::c_uint, watch_path: &str, log_path: &str) -
 
 /// FAN_MODIFY | FAN_CLOSE_WRITE, legacy (non-FID) mode. Unchanged from the
 /// version confirmed live: correctly attributes in-place-truncate writes.
-fn legacy_watcher(watch_path: String, log_path: String, table: ProcTable) {
+fn legacy_watcher(watch_path: String, log_path: String, table: ProcTable, graph: SharedGraph) {
     let fd = fanotify_init_or_die(libc::FAN_CLASS_NOTIF, &watch_path, &log_path);
 
     let watch_cstr = CString::new(watch_path.as_str()).unwrap();
@@ -255,7 +289,7 @@ fn legacy_watcher(watch_path: String, log_path: String, table: ProcTable) {
                     } else {
                         "modify"
                     };
-                    log_event(&mut log, &path, op, meta.pid, &table);
+                    log_event(&mut log, &path, op, meta.pid, &table, &graph);
                 }
                 unsafe {
                     libc::close(event_fd);
@@ -286,7 +320,7 @@ fn op_name(mask: u64) -> &'static str {
 /// FAN_REPORT_DFID_NAME mode: create/delete/rename/attrib, via the dirent
 /// event API. Events carry a parent-directory file handle + child filename
 /// instead of a directly usable fd — see module doc comment for the shape.
-fn fid_watcher(watch_path: String, log_path: String, table: ProcTable) {
+fn fid_watcher(watch_path: String, log_path: String, table: ProcTable, graph: SharedGraph) {
     let fd = fanotify_init_or_die(
         libc::FAN_CLASS_NOTIF | libc::FAN_REPORT_DFID_NAME,
         &watch_path,
@@ -435,6 +469,7 @@ fn fid_watcher(watch_path: String, log_path: String, table: ProcTable) {
                                             op_name(meta.mask),
                                             meta.pid,
                                             &table,
+                                            &graph,
                                         );
                                     }
                                 }
@@ -483,7 +518,7 @@ fn fid_watcher(watch_path: String, log_path: String, table: ProcTable) {
 //             struct since what+cpu already occupy exactly 8 bytes)
 //   [52..56)  union.process_pid      (i32 — same offset for EXEC and EXIT)
 //   [56..60)  union.process_tgid     (i32, unused)
-fn proc_connector(table: ProcTable) {
+fn proc_connector(table: ProcTable, graph: SharedGraph) {
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, libc::NETLINK_CONNECTOR) };
     if fd < 0 {
         eprintln!(
@@ -548,10 +583,14 @@ fn proc_connector(table: ProcTable) {
         return;
     }
 
-    eprintln!("whodidd: [proc] connector listening for exec/exit");
+    eprintln!("whodidd: [proc] connector listening for fork/exec/exit");
 
     const PROC_EVENT_OFF: usize = 36;
     const UNION_OFF: usize = PROC_EVENT_OFF + 16;
+    // fork's union is { parent_pid, parent_tgid, child_pid, child_tgid },
+    // so the child sits two i32s past the start of the union — unlike
+    // exec/exit, where the pid is the first field.
+    const FORK_CHILD_OFF: usize = UNION_OFF + 8;
 
     let mut buf = [0u8; 4096];
     loop {
@@ -572,18 +611,38 @@ fn proc_connector(table: ProcTable) {
         let process_pid =
             unsafe { std::ptr::read_unaligned(buf.as_ptr().add(UNION_OFF) as *const i32) };
 
-        if what == libc::PROC_EVENT_EXEC {
+        if what == libc::PROC_EVENT_FORK {
+            // The parent→child edge. This is the one fact nothing else on
+            // the system records, and the whole causal graph rests on it:
+            // without fork edges you can say "sh wrote this" but never
+            // "sh wrote this *because* you ran that install script".
+            if n < FORK_CHILD_OFF + 4 {
+                continue;
+            }
+            let parent_pid = process_pid;
+            let child_pid =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(FORK_CHILD_OFF) as *const i32) };
+            if let Some(g) = graph.as_ref() {
+                let _ = g.record_fork(parent_pid, child_pid);
+            }
+        } else if what == libc::PROC_EVENT_EXEC {
             let info = ProcInfo {
                 exe: read_exe(process_pid),
                 comm: read_proc_str(process_pid, "comm"),
                 cmdline: read_cmdline(process_pid),
                 uid: read_uid(process_pid),
             };
+            if let Some(g) = graph.as_ref() {
+                let _ = g.record_exec(process_pid, &info.exe, &info.comm, &info.cmdline, info.uid);
+            }
             table.lock().unwrap().insert(process_pid, info);
         } else if what == libc::PROC_EVENT_EXIT {
             // Must evict, not just leave stale: pids get reused, and a
             // stale entry would misattribute a later, unrelated process.
             table.lock().unwrap().remove(&process_pid);
+            if let Some(g) = graph.as_ref() {
+                let _ = g.record_exit(process_pid);
+            }
         }
     }
 }
@@ -597,19 +656,42 @@ fn main() {
     let watch_path = args[1].clone();
     let log_path = args[2].clone();
 
+    // The graph lives beside the JSONL log rather than taking another
+    // argument, so existing invocations (services, demo.sh) keep working
+    // unchanged and simply gain a graph.
+    let graph_path = Path::new(&log_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("graph.db");
+
+    let graph: SharedGraph = match Graph::open(&graph_path) {
+        Ok(g) => {
+            eprintln!("whodidd: [graph] recording to {}", graph_path.display());
+            Some(Arc::new(g))
+        }
+        Err(e) => {
+            // Deliberately non-fatal: attribution to the JSONL log is the
+            // proven path and still works without the graph.
+            eprintln!("whodidd: [graph] disabled ({e}) — JSONL attribution continues");
+            None
+        }
+    };
+
     let table: ProcTable = Arc::new(Mutex::new(HashMap::new()));
 
     let proc_conn = {
         let t = table.clone();
-        thread::spawn(move || proc_connector(t))
+        let g = graph.clone();
+        thread::spawn(move || proc_connector(t, g))
     };
     let legacy = {
         let w = watch_path.clone();
         let l = log_path.clone();
         let t = table.clone();
-        thread::spawn(move || legacy_watcher(w, l, t))
+        let g = graph.clone();
+        thread::spawn(move || legacy_watcher(w, l, t, g))
     };
-    let fid = thread::spawn(move || fid_watcher(watch_path, log_path, table));
+    let fid = thread::spawn(move || fid_watcher(watch_path, log_path, table, graph));
 
     let _ = proc_conn.join();
     let _ = legacy.join();

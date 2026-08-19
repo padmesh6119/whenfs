@@ -14,6 +14,20 @@ zero modification. Paired with `whodid`, which answers a question no OS
 currently can: *what process changed this file, when, and what exactly did
 it change.*
 
+And with `chronicle`, which answers the one after it — **why**:
+
+```
+$ chronicle blame /etc/sudoers.d/99-thing
+/etc/sudoers.d/99-thing
+  2026-08-20T09-00-04  create  sh  pid 1002
+  because:      sh ← curl ← bash
+  root command: curl -fsSL https://get.example.com | sh
+```
+
+That chain is the causal graph: not just *who* wrote a file, but the lineage
+of commands that led to that process existing at all. Snapshots record
+state; only a live daemon watching fork/exec can record cause.
+
 **Verified live**, not just in tests: `./demo.sh` mounts a real `whenfs`, runs a real
 `whodidd` under `sudo`, and `whodid diff`/`whodid list` correctly attributed real edits,
 a real rename, and a real create+delete to the exact processes that made them — down to
@@ -32,10 +46,18 @@ See `../ARCHITECTURE.md` for the full design and rationale.
   proc-connector that caches process identity at exec time — live-verified
   to genuinely help (a real `mv`'s full cmdline, previously lost, is now
   captured) without fully closing the race for very short-lived processes
-  (a real `rm` still lost its identity — see below). Logs to JSONL.
-- `whodid` — query tool. `list` shows history for a file; `diff` brackets
-  each logged change between the snapshots on either side and shows the
-  real content diff.
+  (a real `rm` still lost its identity — see below). Also records
+  `PROC_EVENT_FORK`, which supplies the parent→child edges the causal
+  graph is built from. Writes to two sinks: the JSONL audit log and the
+  SQLite graph beside it.
+- `whodid` — query tool over the JSONL log. `list` shows history for a
+  file; `diff` brackets each logged change between the snapshots on either
+  side and shows the real content diff.
+- `chronicle` — query tool over the causal graph. `blame <path>` shows who
+  last wrote a file *and the ancestry chain explaining why that process
+  existed*; `log <path>` is full per-file history; `tree <pid>` lists every
+  process descended from one, which is the primitive a future
+  trace-and-revert would scope itself with; `stat` shows graph size.
 - `snapshot.sh` — three interchangeable backends via `SNAPSHOT_MODE`, all
   live-verified: `hardlink` (default, `cp -al`, any filesystem, no
   privilege), `full` (`cp -a`, real independent copy, small trees only),
@@ -80,8 +102,45 @@ snapshot at or before it. Full parser in `src/time_expr.rs`, with unit
 tests (`cargo test --lib`) covering the boundary cases — weekday-equals-today,
 month arithmetic, snapshot-bracket edges.
 
+## The causal graph
+
+`whodidd` maintains a SQLite graph (`graph.db`, beside the JSONL log):
+
+| | |
+|---|---|
+| `processes` | keyed on `(pid, start_ts)` — a bare pid is **not** an identity, because pids recycle |
+| `events` | every file write, bound to the *live incarnation* of the writing pid |
+| fork edge | `ppid`, from `PROC_EVENT_FORK` — the parent→child link nothing else on the system records |
+
+Transitive queries (ancestry upward, descendants downward) run as recursive
+CTEs in SQLite rather than by loading all of history into memory — which is
+why this moved off JSONL. The append-only log is still the audit trail; the
+graph is the queryable index built from it.
+
+Correctness properties covered by tests (`cargo test --lib`):
+
+- a recycled pid never inherits a dead process's identity (`exit_ts` is
+  load-bearing, not hygiene)
+- `fork` then `exec` produces **one** process row, preserving the parent
+  edge — exec replaces the image, not the process
+- a write by an unidentified process is recorded with NULL attribution
+  rather than dropped or guessed at; a hole in the graph is itself
+  information
+- process-tree scoping excludes unrelated concurrent writers, verified with
+  a decoy process writing at the same moment
+
 ## Known v0 limitations
 
+- **The causal graph has not been live-verified yet.** Its logic is covered
+  by unit tests and the `chronicle` CLI was exercised end-to-end against a
+  seeded database, but no run has yet had `whodidd` populate a graph from
+  real fanotify + fork traffic under root. Every prior component here
+  produced real bugs only once it met real kernel events, so treat the
+  graph as unproven until that run happens.
+- **Recording every fork is untested at scale.** A busy machine forks
+  constantly (every shell pipeline stage). Process rows are small and the
+  edge is essential, but growth rate and the resulting SQLite size under
+  real load are unmeasured.
 - **No rename-cookie correlation.** fanotify doesn't pair `FAN_MOVED_FROM`
   with its matching `FAN_MOVED_TO` the way inotify does; each is logged as
   an independent event rather than one "renamed X to Y" record.
