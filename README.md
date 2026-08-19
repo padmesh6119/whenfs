@@ -53,11 +53,16 @@ See `../ARCHITECTURE.md` for the full design and rationale.
 - `whodid` — query tool over the JSONL log. `list` shows history for a
   file; `diff` brackets each logged change between the snapshots on either
   side and shows the real content diff.
-- `chronicle` — query tool over the causal graph. `blame <path>` shows who
-  last wrote a file *and the ancestry chain explaining why that process
-  existed*; `log <path>` is full per-file history; `tree <pid>` lists every
-  process descended from one, which is the primitive a future
-  trace-and-revert would scope itself with; `stat` shows graph size.
+- `chronicle` — query tool over the causal graph.
+  - `trace -- <cmd>` runs a command and reports **every path it and its
+    descendants touched**. Scoped by process tree, not by time window —
+    which is the only thing that works, since a browser cache and a dozen
+    daemons are writing throughout. This is what the fork edge was for.
+  - `blame <path>` — who last wrote a file, *and the ancestry chain
+    explaining why that process existed*.
+  - `log <path>` — full per-file history.
+  - `tree <pid>` — every process descended from one.
+  - `stat` — graph size.
 - `snapshot.sh` — three interchangeable backends via `SNAPSHOT_MODE`, all
   live-verified: `hardlink` (default, `cp -al`, any filesystem, no
   privilege), `full` (`cp -a`, real independent copy, small trees only),

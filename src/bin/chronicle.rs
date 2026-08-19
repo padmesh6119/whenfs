@@ -8,6 +8,7 @@
 //! Database location, in order: --db <path>, $WHENFS_GRAPH, ./graph.db,
 //! /var/lib/whenfs/graph.db.
 
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use whenfs::graph::{FileEvent, Graph};
@@ -154,7 +155,15 @@ fn cmd_tree(g: &Graph, pid_arg: &str) {
             return;
         }
     };
-    let start = match g.live_start_ts(pid) {
+    // Fall back to the latest incarnation: asking about a process that
+    // has already finished is the common case, not an error.
+    let start = match g.live_start_ts(pid).and_then(|s| {
+        if s.is_some() {
+            Ok(s)
+        } else {
+            g.latest_start_ts(pid)
+        }
+    }) {
         Ok(Some(s)) => s,
         Ok(None) => {
             println!("no live process recorded with pid {pid}");
@@ -182,6 +191,119 @@ fn cmd_tree(g: &Graph, pid_arg: &str) {
     }
 }
 
+/// Run a command and report everything it and its descendants touched.
+///
+/// This is the whole point of recording lineage. A time window alone is
+/// useless here -- a browser cache and a dozen system daemons are writing
+/// throughout -- so the manifest is scoped by process tree, which is why
+/// the fork edge had to be correct before this could exist at all.
+///
+/// Requires whodidd to be running: this only reads the graph, it does not
+/// do any tracing itself. The command runs completely normally, unmodified
+/// and unsandboxed; the daemon is already watching everything anyway.
+fn cmd_trace(g: &Graph, argv: &[String]) {
+    use std::process::Command;
+
+    let Some((prog, args)) = argv.split_first() else {
+        eprintln!("nothing to run");
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    let mut child = match Command::new(prog).args(args).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("cannot run {prog}: {e}");
+            return;
+        }
+    };
+    let pid = child.id() as i32;
+
+    // The daemon learns about this process asynchronously, over a separate
+    // socket. Give it a moment to see the fork -- but keep looking after
+    // the child exits too, since a fast command can finish before its own
+    // fork message has been read.
+    let mut start_ts = None;
+    for _ in 0..40 {
+        if let Ok(Some(s)) = g.latest_start_ts(pid) {
+            start_ts = Some(s);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let status = child.wait();
+    let elapsed = started.elapsed();
+
+    // Writes are recorded asynchronously as well; without a settle the
+    // manifest reports fewer files than the command actually touched.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    if start_ts.is_none() {
+        start_ts = g.latest_start_ts(pid).ok().flatten();
+    }
+
+    let code = match status {
+        Ok(s) => s.code().map(|c| c.to_string()).unwrap_or("signal".into()),
+        Err(e) => format!("wait failed: {e}"),
+    };
+    println!(
+        "\n{BOLD}traced{RESET} {}  {DIM}exit {}, {:.1}s{RESET}",
+        argv.join(" "),
+        code,
+        elapsed.as_secs_f32()
+    );
+
+    let Some(start) = start_ts else {
+        eprintln!(
+            "  {YELLOW}the daemon never recorded this process{RESET}
+  Is whodidd running, and watching the filesystem this ran on?"
+        );
+        return;
+    };
+
+    let events = match g.events_by_tree(pid, &start) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("query failed: {e}");
+            return;
+        }
+    };
+    let procs = g.descendants(pid, &start).map(|p| p.len()).unwrap_or(0);
+
+    if events.is_empty() {
+        println!("  {DIM}no recorded writes{RESET}  {DIM}({procs} processes){RESET}");
+        return;
+    }
+
+    // One line per path, not per event: a single logical change usually
+    // produces several (create, then modify, then close_write), and the
+    // useful question is "what did this touch", not "how many syscalls".
+    let mut order: Vec<String> = Vec::new();
+    let mut ops: HashMap<String, Vec<String>> = HashMap::new();
+    let mut by: HashMap<String, String> = HashMap::new();
+    for e in &events {
+        let entry = ops.entry(e.path.clone()).or_insert_with(|| {
+            order.push(e.path.clone());
+            Vec::new()
+        });
+        if !entry.contains(&e.op) {
+            entry.push(e.op.clone());
+        }
+        by.entry(e.path.clone()).or_insert_with(|| who(e));
+    }
+
+    println!(
+        "  {BOLD}{}{RESET} paths touched by {BOLD}{}{RESET} processes\n",
+        order.len(),
+        procs
+    );
+    for path in &order {
+        let o = ops.get(path).map(|v| v.join("+")).unwrap_or_default();
+        let w = by.get(path).cloned().unwrap_or_default();
+        println!("  {CYAN}{:<22}{RESET} {}  {DIM}{}{RESET}", o, path, w);
+    }
+}
+
 fn cmd_stat(g: &Graph, db: &Path) {
     match g.counts() {
         Ok((procs, events)) => {
@@ -199,6 +321,7 @@ fn usage() -> ! {
   chronicle log   <path>     full history of a file
   chronicle blame <path>     who last wrote it, and why
   chronicle tree  <pid>      everything a process tree touched
+  chronicle trace -- <cmd>   run a command, report every file it touched
   chronicle stat             graph size
 
   --db <path>                database location
@@ -252,6 +375,16 @@ Looked for: $WHENFS_GRAPH, ./graph.db, /var/lib/whenfs/graph.db"
         ("blame", 2) => cmd_blame(&g, &rest[1]),
         ("tree", 2) => cmd_tree(&g, &rest[1]),
         ("stat", 1) => cmd_stat(&g, &db),
+        ("trace", n) if n >= 2 => {
+            // Everything after `trace` (and an optional `--`) is the
+            // command, so its own flags are never parsed as ours.
+            let start = if rest.get(1).map(String::as_str) == Some("--") {
+                2
+            } else {
+                1
+            };
+            cmd_trace(&g, &rest[start..]);
+        }
         _ => usage(),
     }
 }

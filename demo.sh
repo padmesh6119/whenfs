@@ -209,12 +209,36 @@ if [ "$RUNNING_AS_ROOT" -eq 1 ]; then
 
         echo
         echo "############################################################"
-        echo "# chronicle tree \$\$ — expected to report nothing, for a"
-        echo "#   real reason: this script predates the daemon, so it has"
-        echo "#   no row. Its children do. Shown to prove the tool says so"
-        echo "#   plainly instead of inventing a tree."
+        echo "# chronicle tree \$\$ — every process this demo spawned."
+        echo "#   Works even though the script predates the daemon: the"
+        echo "#   /proc bootstrap seeds already-running processes at start."
         echo "############################################################"
         "$BIN/chronicle" --db "$GRAPH" tree "$$" 2>&1 | head -20
+
+        # ---- trace ---------------------------------------------------
+        # The payoff. A throwaway "installer" that scatters files around
+        # and spawns children, run under trace: the manifest must contain
+        # exactly what it touched and nothing from the rest of the machine,
+        # which only works because the scoping is by process tree.
+        cat > "$LAB/fake-install.sh" <<'INSTALLER'
+#!/bin/sh
+mkdir -p "$1/opt/thing"
+echo "binary"  > "$1/opt/thing/thing"
+echo "cfg"     > "$1/etc-thing.conf"
+sh -c "echo 'from a grandchild' > '$1/nested.conf'"
+cp "$1/etc-thing.conf" "$1/etc-thing.conf.bak"
+rm -f "$1/etc-thing.conf.bak"
+INSTALLER
+        chmod +x "$LAB/fake-install.sh"
+
+        echo
+        echo "############################################################"
+        echo "# chronicle trace -- sh fake-install.sh"
+        echo "#   every path the script and its children touched, scoped"
+        echo "#   by lineage. Unrelated writes elsewhere on the machine"
+        echo "#   must NOT appear."
+        echo "############################################################"
+        "$BIN/chronicle" --db "$GRAPH" trace -- sh "$LAB/fake-install.sh" "$LAB/live"
     fi
 fi
 

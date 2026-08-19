@@ -281,6 +281,24 @@ impl Graph {
         Ok(())
     }
 
+    /// The most recent incarnation of `pid`, alive or not.
+    ///
+    /// Distinct from `live_start_ts` on purpose: anything asking about a
+    /// command that has already finished -- `trace`, or `tree` on a process
+    /// that has since exited -- must not filter on liveness, which is the
+    /// same mistake that cost attribution twice already.
+    pub fn latest_start_ts(&self, pid: i32) -> rusqlite::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT start_ts FROM processes WHERE pid = ?1
+                 ORDER BY start_ts DESC LIMIT 1",
+                params![pid],
+                |r| r.get(0),
+            )
+            .ok())
+    }
+
     /// The start_ts of the live incarnation of `pid`, which is what turns
     /// a bare pid from the command line into a graph identity.
     pub fn live_start_ts(&self, pid: i32) -> rusqlite::Result<Option<String>> {
@@ -663,6 +681,28 @@ mod tests {
             .map(|p| p.comm)
             .collect();
         assert_eq!(chain, vec!["cp", "sh", "bash"]);
+    }
+
+    #[test]
+    fn latest_start_ts_finds_exited_processes_but_live_start_ts_does_not() {
+        // trace asks about a command that has, by definition, just
+        // finished. Reusing the liveness-filtered lookup there would
+        // repeat the mistake that cost attribution twice already.
+        let g = mem_graph();
+        g.record_fork(1, 900).unwrap();
+        g.record_exec(900, "/bin/sh", "sh", "sh install.sh", 1000)
+            .unwrap();
+        assert!(g.live_start_ts(900).unwrap().is_some());
+
+        g.record_exit(900).unwrap();
+        assert!(
+            g.live_start_ts(900).unwrap().is_none(),
+            "live lookup must not resurrect a dead process"
+        );
+        assert!(
+            g.latest_start_ts(900).unwrap().is_some(),
+            "trace must still find the command it just ran"
+        );
     }
 
     #[test]
