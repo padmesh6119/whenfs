@@ -180,15 +180,50 @@ impl Graph {
         let ts = now_ts();
         let conn = self.conn.lock().unwrap();
 
+        // Resolve the pid to an incarnation by TIME WINDOW, not liveness.
+        //
+        // The obvious query — `WHERE exit_ts IS NULL` — is wrong, and a
+        // live run proved it catastrophically so: 27228 of 27231 events
+        // came back unattributed. fanotify and the netlink connector are
+        // two independent sockets read by two independent threads, with no
+        // ordering guarantee between them, so a short-lived process (`cp`,
+        // `rm`, anything in a shell pipeline) is routinely recorded as
+        // exited before its own write event gets processed. Filtering on
+        // liveness then discards the very attribution we exist to capture.
+        //
+        // Matching the event against each incarnation's [start, exit]
+        // window instead is correct for both cases it has to serve: pid
+        // reuse (distinct incarnations occupy disjoint windows) and
+        // short-lived processes (already exited, but the window still
+        // contains the event).
         let proc_start: Option<String> = conn
             .query_row(
                 "SELECT start_ts FROM processes
-                 WHERE pid = ?1 AND exit_ts IS NULL
+                 WHERE pid = ?1
+                   AND start_ts <= ?2
+                   AND (exit_ts IS NULL OR exit_ts >= ?2)
                  ORDER BY start_ts DESC LIMIT 1",
-                params![pid],
+                params![pid, ts],
                 |r| r.get(0),
             )
-            .ok();
+            .ok()
+            // Timestamps are second-granularity and assigned when we
+            // *process* an event, not when it occurred, so a write can be
+            // stamped a tick after the writer's recorded exit. Fall back to
+            // the newest incarnation that started before the event rather
+            // than losing attribution to a rounding edge. Misattribution
+            // here would require a full pid wraparound inside that gap,
+            // which is not a realistic race.
+            .or_else(|| {
+                conn.query_row(
+                    "SELECT start_ts FROM processes
+                     WHERE pid = ?1 AND start_ts <= ?2
+                     ORDER BY start_ts DESC LIMIT 1",
+                    params![pid, ts],
+                    |r| r.get(0),
+                )
+                .ok()
+            });
 
         conn.execute(
             "INSERT INTO events (ts, path, op, pid, proc_start) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -427,9 +462,28 @@ mod tests {
 
         let log = g.log_file("/tmp/f").unwrap();
         assert_eq!(log.len(), 1);
-        // Must resolve to the live one; attributing this to "old" would be
-        // exactly the pid-reuse bug the exit_ts column exists to prevent.
+        // Must resolve to the second incarnation; attributing this to
+        // "old" would be exactly the pid-reuse bug being guarded against.
         assert_eq!(log[0].comm, "new");
+    }
+
+    #[test]
+    fn short_lived_process_is_still_attributed_after_it_exits() {
+        // The live-run regression: fanotify and the connector are separate
+        // sockets, so the exit is routinely recorded before the write event
+        // is processed. Resolving on liveness lost 99.99% of attribution.
+        let g = mem_graph();
+        g.record_fork(1, 700).unwrap();
+        g.record_exec(700, "/bin/cp", "cp", "cp a b", 1000).unwrap();
+        g.record_exit(700).unwrap();
+
+        // Write processed only after the process is already gone.
+        g.record_event("/tmp/copied", "create", 700).unwrap();
+
+        let log = g.log_file("/tmp/copied").unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].comm, "cp", "a dead writer must still be named");
+        assert!(log[0].proc_start.is_some(), "must bind to an incarnation");
     }
 
     #[test]

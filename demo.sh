@@ -168,6 +168,54 @@ if [ "$RUNNING_AS_ROOT" -eq 1 ]; then
     echo "# whodid list scratch.txt — should show create, then delete"
     echo "############################################################"
     "$BIN/whodid" list "$LAB/events.jsonl" "$LAB/live/scratch.txt"
+
+    # ---- causal graph ----------------------------------------------
+    # Everything above queries the JSONL log. This section queries the
+    # SQLite graph instead, and is the part that needs real fanotify +
+    # PROC_EVENT_FORK traffic to mean anything: the ancestry chain can
+    # only exist if the daemon actually saw this shell fork its children.
+    GRAPH="$LAB/graph.db"
+
+    echo
+    echo "############################################################"
+    echo "# chronicle stat — did the daemon actually populate a graph?"
+    echo "############################################################"
+    if [ ! -s "$GRAPH" ]; then
+        echo "NO GRAPH at $GRAPH — whodidd did not create one"
+    else
+        "$BIN/chronicle" --db "$GRAPH" stat
+
+        # A write from a process the daemon watched fork, so the lineage
+        # is real rather than reconstructed: a subshell running a
+        # separate binary, several levels below demo.sh.
+        ( sh -c "cp '$LAB/live/nginx.conf' '$LAB/live/traced.conf'" )
+        sleep 0.5
+
+        echo
+        echo "############################################################"
+        echo "# chronicle log traced.conf"
+        echo "############################################################"
+        "$BIN/chronicle" --db "$GRAPH" log "$LAB/live/traced.conf"
+
+        echo
+        echo "############################################################"
+        echo "# chronicle blame traced.conf"
+        echo "#   ancestry is the claim under test. Note it stops at the"
+        echo "#   first process whodidd never saw fork: this script was"
+        echo "#   already running before the daemon started, so the chain"
+        echo "#   climbs only as far as the daemon actually observed."
+        echo "############################################################"
+        "$BIN/chronicle" --db "$GRAPH" blame "$LAB/live/traced.conf"
+
+        echo
+        echo "############################################################"
+        echo "# chronicle tree \$\$ — expected to report nothing, for a"
+        echo "#   real reason: this script predates the daemon, so it has"
+        echo "#   no row. Its children do. Shown to prove the tool says so"
+        echo "#   plainly instead of inventing a tree."
+        echo "############################################################"
+        "$BIN/chronicle" --db "$GRAPH" tree "$$" 2>&1 | head -20
+    fi
 fi
 
 echo
