@@ -92,6 +92,25 @@ fn is_blocked(path: &str) -> bool {
     BLOCKLIST_SUFFIXES.iter().any(|s| path.contains(s))
 }
 
+/// Our own pid. Every write this daemon makes -- the JSONL log, the SQLite
+/// database and its -wal/-shm sidecars -- lands inside the mount it is
+/// watching, so recording them creates an unbounded feedback loop: each
+/// recorded event is itself a write, which produces another event.
+///
+/// This is not hypothetical. A live run produced 27231 events in about ten
+/// seconds, of which 27214 (99.94%) were this daemon writing to
+/// `events.jsonl` and `graph.db-wal`. Left in place it would fill the disk
+/// on any machine it ran on persistently.
+///
+/// Suppressing by pid rather than by path is deliberate: it holds no matter
+/// where the log and database are placed, and there is no case where the
+/// daemon's own bookkeeping is worth attributing.
+static SELF_PID: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+
+fn is_self(pid: i32) -> bool {
+    *SELF_PID.get_or_init(|| std::process::id() as i32) == pid
+}
+
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -137,6 +156,71 @@ fn read_uid(pid: i32) -> u32 {
     std::fs::metadata(format!("/proc/{pid}"))
         .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
         .unwrap_or(u32::MAX)
+}
+
+/// The parent pid from /proc/<pid>/stat.
+///
+/// Field 2 is the executable name in parentheses and may itself contain
+/// spaces or parentheses, so the only safe parse is to seek past the final
+/// ')' -- splitting the line on whitespace from the left corrupts on any
+/// process whose name contains a space.
+fn read_ppid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.rfind(')')? + 1..];
+    // after ')' the fields are: state ppid ...
+    after.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Seed the graph with every process already running, so writes by
+/// long-lived processes are attributable rather than anonymous. See
+/// Graph::record_existing for why the daemon's start time is used as
+/// their start_ts.
+fn bootstrap_process_table(graph: &SharedGraph, table: &ProcTable) {
+    let Some(g) = graph.as_ref() else { return };
+    let start_ts = whenfs::graph::now_ts();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        eprintln!("whodidd: [proc] cannot scan /proc; pre-existing processes stay anonymous");
+        return;
+    };
+
+    let mut seeded = 0usize;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+
+        let comm = read_proc_str(pid, "comm");
+        let exe = read_exe(pid);
+        let cmdline = read_cmdline(pid);
+        let uid = read_uid(pid);
+        // A process that vanished mid-scan leaves nothing worth recording.
+        if comm.is_empty() && exe.is_empty() && cmdline.is_empty() {
+            continue;
+        }
+        let id = whenfs::graph::Identity {
+            exe: &exe,
+            comm: &comm,
+            cmdline: &cmdline,
+            uid,
+        };
+        if g.record_existing(pid, read_ppid(pid), id, &start_ts)
+            .is_ok()
+        {
+            seeded += 1;
+            table.lock().unwrap().insert(
+                pid,
+                ProcInfo {
+                    exe,
+                    comm,
+                    cmdline,
+                    uid,
+                },
+            );
+        }
+    }
+    eprintln!("whodidd: [graph] seeded {seeded} already-running processes");
 }
 
 fn open_log(log_path: &str) -> File {
@@ -283,7 +367,7 @@ fn legacy_watcher(watch_path: String, log_path: String, table: ProcTable, graph:
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
 
-                if !path.is_empty() && !is_blocked(&path) {
+                if !path.is_empty() && !is_blocked(&path) && !is_self(meta.pid) {
                     let op = if meta.mask & libc::FAN_CLOSE_WRITE != 0 {
                         "close_write"
                     } else {
@@ -462,7 +546,7 @@ fn fid_watcher(watch_path: String, log_path: String, table: ProcTable, graph: Sh
                                     } else {
                                         format!("{}/{}", parent.display(), filename)
                                     };
-                                    if !is_blocked(&full_path) {
+                                    if !is_blocked(&full_path) && !is_self(meta.pid) {
                                         log_event(
                                             &mut log,
                                             &full_path,
@@ -678,6 +762,7 @@ fn main() {
     };
 
     let table: ProcTable = Arc::new(Mutex::new(HashMap::new()));
+    bootstrap_process_table(&graph, &table);
 
     let proc_conn = {
         let t = table.clone();

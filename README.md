@@ -131,16 +131,35 @@ Correctness properties covered by tests (`cargo test --lib`):
 
 ## Known v0 limitations
 
-- **The causal graph has not been live-verified yet.** Its logic is covered
-  by unit tests and the `chronicle` CLI was exercised end-to-end against a
-  seeded database, but no run has yet had `whodidd` populate a graph from
-  real fanotify + fork traffic under root. Every prior component here
-  produced real bugs only once it met real kernel events, so treat the
-  graph as unproven until that run happens.
+- **The graph's first live run found three real bugs.** Documented here
+  because they are the useful part; all three are fixed, but the fixes
+  have not themselves been re-verified live yet.
+
+  1. *Self-write feedback loop.* The daemon writes its log and database
+     inside the mount it watches, so each recorded event was itself a write
+     that produced another event. The run generated 27231 events in ~10
+     seconds, **27214 of them (99.94%) the daemon recording itself**. Fixed
+     by suppressing events from its own pid -- by pid rather than by path,
+     so it holds wherever the files are placed.
+  2. *pid resolution used liveness, not time.* `record_event` bound a pid
+     with `WHERE exit_ts IS NULL`. fanotify and the netlink connector are
+     independent sockets on independent threads, so a short-lived process
+     is routinely recorded as exited before its own write is processed,
+     and attribution was discarded. Now resolved against each incarnation's
+     `[start_ts, exit_ts]` window, correct for both pid reuse and
+     short-lived writers.
+  3. *Nothing that predated the daemon was known.* Only processes forking
+     after startup were recorded, so on a real machine almost every writer
+     -- services, editors, browsers -- was anonymous. The daemon now seeds
+     the table from `/proc` at startup.
+
+  Worth noting the unit tests passed throughout all three. They called
+  `record_event` before `record_exit`; real kernel ordering is the reverse.
+  Only live traffic exposed it.
 - **Recording every fork is untested at scale.** A busy machine forks
-  constantly (every shell pipeline stage). Process rows are small and the
-  edge is essential, but growth rate and the resulting SQLite size under
-  real load are unmeasured.
+  constantly. Process rows are small and the edge is essential, but growth
+  under real load is unmeasured -- and the one measurement taken so far was
+  dominated by the feedback loop above, so it says nothing useful yet.
 - **No rename-cookie correlation.** fanotify doesn't pair `FAN_MOVED_FROM`
   with its matching `FAN_MOVED_TO` the way inotify does; each is logged as
   an independent event rather than one "renamed X to Y" record.

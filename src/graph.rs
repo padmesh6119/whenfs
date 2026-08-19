@@ -54,6 +54,17 @@ pub struct FileEvent {
     pub proc_start: Option<String>,
 }
 
+/// Grouped so the three adjacent strings can't be passed in the wrong
+/// order at a call site -- exe/comm/cmdline are all &str and a swap would
+/// be silent, surfacing much later as mislabelled attribution.
+#[derive(Debug, Clone, Copy)]
+pub struct Identity<'a> {
+    pub exe: &'a str,
+    pub comm: &'a str,
+    pub cmdline: &'a str,
+    pub uid: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcRow {
     pub pid: i32,
@@ -157,6 +168,44 @@ impl Graph {
                 params![pid, ts, exe, comm, cmdline, uid as i64],
             )?;
         }
+        Ok(())
+    }
+
+    /// Record a process that was already running when the daemon started.
+    ///
+    /// Without this the graph only ever knows processes that fork *after*
+    /// startup, which on a real machine is a small minority of the things
+    /// actually writing to disk -- every long-running service, editor and
+    /// browser is invisible, and their writes land unattributed.
+    ///
+    /// `start_ts` is the daemon's own start time rather than the process's
+    /// true birth: the claim being recorded is "this existed as of daemon
+    /// start", which is all that can be honestly asserted, and it satisfies
+    /// the `start_ts <= event_ts` resolution for every event that follows.
+    /// A later incarnation of the same pid gets a strictly later start_ts,
+    /// so `ORDER BY start_ts DESC` still picks the right one.
+    pub fn record_existing(
+        &self,
+        pid: i32,
+        ppid: Option<i32>,
+        id: Identity<'_>,
+        start_ts: &str,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO processes
+               (pid, start_ts, ppid, exe, comm, cmdline, uid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                pid,
+                start_ts,
+                ppid,
+                id.exe,
+                id.comm,
+                id.cmdline,
+                id.uid as i64
+            ],
+        )?;
         Ok(())
     }
 
@@ -484,6 +533,35 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].comm, "cp", "a dead writer must still be named");
         assert!(log[0].proc_start.is_some(), "must bind to an incarnation");
+    }
+
+    #[test]
+    fn bootstrapped_process_can_be_attributed_and_is_not_duplicated() {
+        // A long-running process that predates the daemon must still be
+        // nameable, or on a real machine almost every write is anonymous.
+        let g = mem_graph();
+        // Must be genuinely in the past: resolution requires
+        // start_ts <= event_ts, and the event is stamped with the real clock.
+        let boot = "2000-01-01T00-00-00";
+        let id = Identity {
+            exe: "/usr/bin/nginx",
+            comm: "nginx",
+            cmdline: "nginx -g",
+            uid: 0,
+        };
+        g.record_existing(400, Some(1), id, boot).unwrap();
+        g.record_event("/var/log/nginx/access.log", "modify", 400)
+            .unwrap();
+
+        let log = g.log_file("/var/log/nginx/access.log").unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].comm, "nginx");
+
+        // Re-seeding (daemon restart) must not create a second row for the
+        // same incarnation.
+        g.record_existing(400, Some(1), id, boot).unwrap();
+        let (procs, _) = g.counts().unwrap();
+        assert_eq!(procs, 1);
     }
 
     #[test]
