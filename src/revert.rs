@@ -169,7 +169,7 @@ pub fn plan(
         .filter(|s| matches!(s, Step::Remove { .. }))
         .cloned()
         .collect();
-    removes.sort_by(|a, b| depth(b.path()).cmp(&depth(a.path())));
+    removes.sort_by_key(|s| std::cmp::Reverse(depth(s.path())));
     ordered.extend(removes);
     ordered.extend(steps.into_iter().filter(|s| matches!(s, Step::Skip { .. })));
     ordered
