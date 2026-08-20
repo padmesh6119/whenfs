@@ -2,7 +2,7 @@
 //!
 //!   chronicle log   <path>        full history of a file, oldest first
 //!   chronicle blame <path>        who last wrote it, and why they existed
-//!   chronicle tree  <pid>         everything a process and its children touched
+//!   chronicle tree  <pid>         processes under one that wrote anything
 //!   chronicle stat                graph size
 //!
 //! Database location, in order: --db <path>, $WHENFS_GRAPH, ./graph.db,
@@ -180,7 +180,13 @@ fn cmd_tree(g: &Graph, pid_arg: &str) {
             println!("no recorded process tree for pid {pid}");
         }
         Ok(procs) => {
-            println!("{BOLD}process tree from pid {pid}{RESET}");
+            // Not every process it spawned: processes reach the graph only
+            // by writing something, or by being an ancestor of something
+            // that did. A shell pipeline that touched no files leaves no
+            // trace here, by design -- see whenfs::proctree.
+            println!(
+                "{BOLD}recorded processes under pid {pid}{RESET}  {DIM}(writers and their ancestors){RESET}"
+            );
             for p in &procs {
                 println!(
                     "  {CYAN}{}{RESET}  {}  {DIM}{}{RESET}",
@@ -270,7 +276,12 @@ fn cmd_trace(g: &Graph, argv: &[String]) {
             return;
         }
     };
-    let procs = g.descendants(pid, &start).map(|p| p.len()).unwrap_or(0);
+    // Counted from the events, not from the process table. Processes are
+    // persisted lazily -- only those that wrote, plus their ancestors --
+    // so a table count would answer a different question than the one the
+    // label asks.
+    let writers: std::collections::HashSet<i32> = events.iter().map(|e| e.pid).collect();
+    let procs = writers.len();
 
     if events.is_empty() {
         println!("  {DIM}no recorded writes{RESET}  {DIM}({procs} processes){RESET}");
@@ -295,7 +306,7 @@ fn cmd_trace(g: &Graph, argv: &[String]) {
     }
 
     println!(
-        "  {BOLD}{}{RESET} paths touched by {BOLD}{}{RESET} processes\n",
+        "  {BOLD}{}{RESET} paths written by {BOLD}{}{RESET} processes\n",
         order.len(),
         procs
     );
@@ -526,7 +537,7 @@ fn usage() -> ! {
         "usage:
   chronicle log   <path>     full history of a file
   chronicle blame <path>     who last wrote it, and why
-  chronicle tree  <pid>      everything a process tree touched
+  chronicle tree  <pid>      processes under one that wrote anything
   chronicle trace -- <cmd>   run a command, report every file it touched
   chronicle revert <pid>     undo a traced command (dry run unless --apply)
                              needs --snap <dir> --live <dir>

@@ -209,9 +209,11 @@ if [ "$RUNNING_AS_ROOT" -eq 1 ]; then
 
         echo
         echo "############################################################"
-        echo "# chronicle tree \$\$ — every process this demo spawned."
-        echo "#   Works even though the script predates the daemon: the"
-        echo "#   /proc bootstrap seeds already-running processes at start."
+        echo "# chronicle tree \$\$ — processes under this script that"
+        echo "#   actually wrote something, plus their ancestors. NOT every"
+        echo "#   process it spawned: sleep and basename touch no files and"
+        echo "#   so never reach the graph at all. That is lazy persistence"
+        echo "#   working, not data missing."
         echo "############################################################"
         "$BIN/chronicle" --db "$GRAPH" tree "$$" 2>&1 | head -20
 

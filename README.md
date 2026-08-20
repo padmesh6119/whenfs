@@ -28,10 +28,12 @@ That chain is the causal graph: not just *who* wrote a file, but the lineage
 of commands that led to that process existing at all. Snapshots record
 state; only a live daemon watching fork/exec can record cause.
 
-**Verified live**, not just in tests: `./demo.sh` mounts a real `whenfs`, runs a real
-`whodidd` under `sudo`, and `whodid diff`/`whodid list` correctly attributed real edits,
-a real rename, and a real create+delete to the exact processes that made them — down to
-telling `mv` apart from the shell that invoked it.
+**Verified live**, not just in tests. `./demo.sh` mounts a real `whenfs`, runs a real
+`whodidd` under `sudo`, and attributes real edits, a real rename and a real create+delete
+to the exact processes that made them — down to telling `mv` apart from the shell that
+invoked it. It then traces a throwaway installer and undoes it: seven paths, one restored
+from snapshot and six removed, nested directories included, with an unrelated file created
+moments earlier correctly left alone.
 
 See `../ARCHITECTURE.md` for the full design and rationale.
 
@@ -61,7 +63,10 @@ See `../ARCHITECTURE.md` for the full design and rationale.
   - `blame <path>` — who last wrote a file, *and the ancestry chain
     explaining why that process existed*.
   - `log <path>` — full per-file history.
-  - `tree <pid>` — every process descended from one.
+  - `tree <pid>` — processes under one that wrote something, plus their
+    ancestors. Not every process it spawned: a `sleep` or a `basename`
+    touches no files and never reaches the graph at all, which is lazy
+    persistence working rather than data missing.
   - `revert <pid>` — undo a traced command: restore each path it touched
     from the newest snapshot predating the command, and delete what it
     created. **Dry run unless `--apply`.** Refuses package-manager state
@@ -277,9 +282,12 @@ Correctness properties covered by tests (`cargo test --lib`):
   still arrive after its author's exit was recorded, and dropping the entry
   early is exactly how short-lived writers lost their identity before.
 
-  **Not yet live-verified.** The design follows from a real measurement,
-  but every previous change here that looked correct in tests still failed
-  its first contact with real kernel traffic.
+  **Live-verified.** The same demo that previously persisted ~430
+  processes now persists **15**, while `blame` still resolves the full
+  chain (`cp ← sh ← bash ← zsh ← x-terminal-emul ← systemd`) — the
+  ancestors-with-writers invariant holding in practice. `tree` lists
+  exactly the writers and their ancestors: no `sleep`, no `basename`, no
+  `grep`, because those touch no files and never reach the graph.
 - **No rename-cookie correlation.** fanotify doesn't pair `FAN_MOVED_FROM`
   with its matching `FAN_MOVED_TO` the way inotify does; each is logged as
   an independent event rather than one "renamed X to Y" record. This
