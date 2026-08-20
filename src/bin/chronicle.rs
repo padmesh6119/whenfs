@@ -71,6 +71,20 @@ fn print_event(e: &FileEvent) {
     } else {
         format!("  {DIM}{}{RESET}", e.cmdline)
     };
+    // Only FAN_RENAME carries both ends; without it a rename is two
+    // unlinked events and there is nothing to show here.
+    if let Some(from) = e.other_path.as_deref() {
+        println!(
+            "  {CYAN}{}{RESET}  {:<12} {}  {DIM}pid {}{RESET}{}\n      {DIM}renamed from {}{RESET}",
+            e.ts,
+            e.op,
+            who(e),
+            e.pid,
+            detail,
+            from
+        );
+        return;
+    }
     println!(
         "  {CYAN}{}{RESET}  {:<12} {}  {DIM}pid {}{RESET}{}",
         e.ts,

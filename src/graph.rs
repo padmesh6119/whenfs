@@ -52,6 +52,11 @@ pub struct FileEvent {
     /// correctly — a bare pid is ambiguous once pids recycle. `None` means
     /// the writer was never identified (a hole in the graph).
     pub proc_start: Option<String>,
+    /// The other end of a rename: for `op == "renamed"`, `path` is the
+    /// destination and this is the source. Only `FAN_RENAME` (Linux 5.17+)
+    /// reports both halves atomically; without it a rename arrives as two
+    /// unrelated `moved_from`/`moved_to` events and this stays `None`.
+    pub other_path: Option<String>,
 }
 
 /// Grouped so the three adjacent strings can't be passed in the wrong
@@ -119,6 +124,12 @@ impl Graph {
             CREATE INDEX IF NOT EXISTS idx_proc_live    ON processes(pid, exit_ts);
             "#,
         )?;
+
+        // Added after the schema shipped, so existing databases need it
+        // grafted on. SQLite has no IF NOT EXISTS for columns; the error on
+        // a second run is "duplicate column name", which is the success
+        // case here and not worth distinguishing from it.
+        let _ = conn.execute("ALTER TABLE events ADD COLUMN other_path TEXT", []);
 
         Ok(Graph {
             conn: Mutex::new(conn),
@@ -243,6 +254,17 @@ impl Graph {
     /// running before the daemon started, or gone before we could look) —
     /// that's a hole in the graph, recorded honestly rather than guessed at.
     pub fn record_event(&self, path: &str, op: &str, pid: i32) -> rusqlite::Result<()> {
+        self.record_event_full(path, op, pid, None)
+    }
+
+    /// As `record_event`, plus the other end of a rename.
+    pub fn record_event_full(
+        &self,
+        path: &str,
+        op: &str,
+        pid: i32,
+        other_path: Option<&str>,
+    ) -> rusqlite::Result<()> {
         let ts = now_ts();
         let conn = self.conn.lock().unwrap();
 
@@ -292,8 +314,9 @@ impl Graph {
             });
 
         conn.execute(
-            "INSERT INTO events (ts, path, op, pid, proc_start) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![ts, path, op, pid, proc_start],
+            "INSERT INTO events (ts, path, op, pid, proc_start, other_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![ts, path, op, pid, proc_start, other_path],
         )?;
         Ok(())
     }
@@ -350,7 +373,7 @@ impl Graph {
         // written, and trusting it keeps this cheap in the common case.
         let mut stmt = conn.prepare(
             "WITH resolved AS (
-               SELECT e.id, e.ts, e.path, e.op, e.pid,
+               SELECT e.id, e.ts, e.path, e.op, e.pid, e.other_path,
                       COALESCE(e.proc_start, (
                         SELECT MAX(p2.start_ts) FROM processes p2
                          WHERE p2.pid = e.pid
@@ -362,7 +385,7 @@ impl Graph {
              )
              SELECT r.ts, r.path, r.op, r.pid,
                     COALESCE(p.comm, ''), COALESCE(p.exe, ''), COALESCE(p.cmdline, ''),
-                    r.rstart
+                    r.rstart, r.other_path
                FROM resolved r
                LEFT JOIN processes p
                  ON p.pid = r.pid AND p.start_ts = r.rstart
@@ -378,6 +401,7 @@ impl Graph {
                 exe: r.get(5)?,
                 cmdline: r.get(6)?,
                 proc_start: r.get(7)?,
+                other_path: r.get(8)?,
             })
         })?;
         rows.collect()
@@ -479,7 +503,7 @@ impl Graph {
             )
             SELECT e.ts, e.path, e.op, e.pid,
                    COALESCE(p.comm, ''), COALESCE(p.exe, ''), COALESCE(p.cmdline, ''),
-                   t.start_ts
+                   t.start_ts, e.other_path
               FROM events e
               -- Same lazy resolution as log_file: match the event against
               -- the incarnation's window rather than requiring the eager
@@ -502,6 +526,7 @@ impl Graph {
                 exe: r.get(5)?,
                 cmdline: r.get(6)?,
                 proc_start: r.get(7)?,
+                other_path: r.get(8)?,
             })
         })?;
         rows.collect()

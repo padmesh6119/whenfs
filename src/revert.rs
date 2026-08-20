@@ -99,10 +99,24 @@ pub fn plan(
     // began interfering with that file, not before its last write.
     let mut order: Vec<String> = Vec::new();
     let mut first_ts: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let touch = |path: &str,
+                 ts: &str,
+                 order: &mut Vec<String>,
+                 first: &mut std::collections::HashMap<String, String>| {
+        if !first.contains_key(path) {
+            order.push(path.to_string());
+            first.insert(path.to_string(), ts.to_string());
+        }
+    };
     for e in events {
-        if !first_ts.contains_key(&e.path) {
-            order.push(e.path.clone());
-            first_ts.insert(e.path.clone(), e.ts.clone());
+        touch(&e.path, &e.ts, &mut order, &mut first_ts);
+        // A rename reported atomically by FAN_RENAME arrives as one event
+        // naming both ends. Undoing it means touching both: the source is
+        // restored and the destination removed, exactly as the two separate
+        // moved_from/moved_to events would have produced. Missing this
+        // would silently leave the source deleted.
+        if let Some(other) = e.other_path.as_deref() {
+            touch(other, &e.ts, &mut order, &mut first_ts);
         }
     }
 
@@ -193,6 +207,7 @@ mod tests {
             exe: String::new(),
             cmdline: String::new(),
             proc_start: None,
+            other_path: None,
         }
     }
 
@@ -386,6 +401,37 @@ mod tests {
         assert!(restored[0].ends_with("a.conf"));
         assert_eq!(removed.len(), 1, "the destination must go: {steps:?}");
         assert!(removed[0].ends_with("b.conf"));
+    }
+
+    #[test]
+    fn an_atomic_rename_event_undoes_both_ends() {
+        // FAN_RENAME reports a rename as a single event naming both paths.
+        // Handling only `path` would restore nothing and leave the source
+        // gone -- worse than the two-event form it replaces.
+        let root = lab();
+        let (snap_root, live) = (root.join("snap"), root.join("live"));
+        let snap = snap_root.join("2026-01-01T00-00-00");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("a.conf"), "original").unwrap();
+
+        let mut e = ev_op(
+            &format!("{}/b.conf", live.display()),
+            "2026-01-02T00-00-00",
+            "renamed",
+        );
+        e.other_path = Some(format!("{}/a.conf", live.display()));
+
+        let steps = plan(&[e], &["2026-01-01T00-00-00".into()], &snap_root, &live);
+        assert_eq!(steps.len(), 2, "both ends must appear: {steps:?}");
+
+        let restored = steps
+            .iter()
+            .any(|s| matches!(s, Step::Restore { path, .. } if path.ends_with("a.conf")));
+        let removed = steps
+            .iter()
+            .any(|s| matches!(s, Step::Remove { path } if path.ends_with("b.conf")));
+        assert!(restored, "the source must come back: {steps:?}");
+        assert!(removed, "the destination must go: {steps:?}");
     }
 
     #[test]

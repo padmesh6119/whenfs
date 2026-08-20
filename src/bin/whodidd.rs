@@ -305,6 +305,20 @@ fn log_event(
     table: &ProcTable,
     graph: &SharedGraph,
 ) {
+    log_event_full(log, path, op, pid, None, table, graph)
+}
+
+/// As `log_event`, plus the other end of an atomic rename.
+#[allow(clippy::too_many_arguments)]
+fn log_event_full(
+    log: &mut File,
+    path: &str,
+    op: &str,
+    pid: i32,
+    other_path: Option<&str>,
+    table: &ProcTable,
+    graph: &SharedGraph,
+) {
     // Two sinks, deliberately, not duplication for its own sake: the JSONL
     // file is the append-only audit trail (proven, and what `whodid`
     // reads), the graph is the queryable index built from it. Log plus
@@ -315,7 +329,7 @@ fn log_event(
     // time -- see ProcTable for why that distinction is load-bearing.
     if let Some(g) = graph.as_ref() {
         persist_chain(table, g, pid);
-        let _ = g.record_event(path, op, pid);
+        let _ = g.record_event_full(path, op, pid, other_path);
     }
     let (exe, comm, cmdline, uid) = {
         let cached = table.lock().unwrap().info(pid);
@@ -436,6 +450,88 @@ fn legacy_watcher(watch_path: String, log_path: String, table: ProcTable, graph:
     }
 }
 
+/// libc 0.2.189 exposes these two but not under the names the loop below
+/// reads best; aliased here so the match arms line up with the DFID_NAME
+/// case beside them.
+const FAN_EVENT_INFO_TYPE_OLD_DFID_NAME: u8 = libc::FAN_EVENT_INFO_TYPE_OLD_DFID_NAME;
+const FAN_EVENT_INFO_TYPE_NEW_DFID_NAME: u8 = libc::FAN_EVENT_INFO_TYPE_NEW_DFID_NAME;
+
+/// Turn one `*_DFID_NAME` info record into an absolute path.
+///
+/// These records carry a *parent directory* file handle plus the child's
+/// name -- not a usable fd. Resolving means rebuilding a `file_handle` in a
+/// heap buffer (Rust cannot express its trailing flexible array member as a
+/// sized type), calling `open_by_handle_at` to get the parent, reading that
+/// fd's `/proc/self/fd/<n>` magic symlink for the parent's real path, and
+/// appending the name.
+///
+/// Returns None on a stale handle -- the parent can be gone by the time the
+/// event is processed, which is ordinary rather than exceptional.
+///
+/// # Safety
+/// `base` must point at a complete event record and the offsets must lie
+/// within it; the caller's bounds checks establish both.
+unsafe fn resolve_dfid_name(
+    base: *const u8,
+    info_offset: usize,
+    record_end: usize,
+    hdr_size: usize,
+    fsid_size: usize,
+    mount_fd: RawFd,
+) -> Option<String> {
+    let fh_hdr_start = info_offset + hdr_size + fsid_size;
+    if fh_hdr_start + 8 > record_end {
+        return None;
+    }
+    let handle_bytes = unsafe { std::ptr::read_unaligned(base.add(fh_hdr_start) as *const u32) };
+    let handle_type = unsafe { std::ptr::read_unaligned(base.add(fh_hdr_start + 4) as *const i32) };
+    let f_handle_start = fh_hdr_start + 8;
+    let name_start = f_handle_start + handle_bytes as usize;
+    if name_start > record_end {
+        return None;
+    }
+
+    let mut name_end = name_start;
+    while name_end < record_end && unsafe { *base.add(name_end) } != 0 {
+        name_end += 1;
+    }
+    let filename = unsafe {
+        String::from_utf8_lossy(std::slice::from_raw_parts(
+            base.add(name_start),
+            name_end - name_start,
+        ))
+        .into_owned()
+    };
+
+    let mut fh_buf = vec![0u8; 8 + handle_bytes as usize];
+    fh_buf[0..4].copy_from_slice(&handle_bytes.to_ne_bytes());
+    fh_buf[4..8].copy_from_slice(&handle_type.to_ne_bytes());
+    let raw_handle =
+        unsafe { std::slice::from_raw_parts(base.add(f_handle_start), handle_bytes as usize) };
+    fh_buf[8..].copy_from_slice(raw_handle);
+
+    let dir_fd = unsafe {
+        libc::open_by_handle_at(
+            mount_fd,
+            fh_buf.as_mut_ptr() as *mut libc::file_handle,
+            libc::O_RDONLY,
+        )
+    };
+    if dir_fd < 0 {
+        return None;
+    }
+    let parent = std::fs::read_link(format!("/proc/self/fd/{dir_fd}"));
+    unsafe {
+        libc::close(dir_fd);
+    }
+    let parent = parent.ok()?;
+    Some(if filename.is_empty() {
+        parent.to_string_lossy().into_owned()
+    } else {
+        format!("{}/{}", parent.display(), filename)
+    })
+}
+
 fn op_name(mask: u64) -> &'static str {
     if mask & libc::FAN_CREATE != 0 {
         "create"
@@ -463,22 +559,33 @@ fn fid_watcher(watch_path: String, log_path: String, table: ProcTable, graph: Sh
     );
 
     let watch_cstr = CString::new(watch_path.as_str()).unwrap();
-    let mask = libc::FAN_CREATE
+    let base_mask = libc::FAN_CREATE
         | libc::FAN_DELETE
         | libc::FAN_MOVED_FROM
         | libc::FAN_MOVED_TO
         | libc::FAN_ATTRIB
         | libc::FAN_ONDIR
         | libc::FAN_EVENT_ON_CHILD;
-    let rc = unsafe {
+
+    // FAN_RENAME (Linux 5.17+) reports a rename as one event naming both
+    // ends, where MOVED_FROM/MOVED_TO arrive as two events with nothing
+    // linking them -- fanotify has no rename cookie. Requesting an
+    // unsupported bit makes the whole mark fail, so try it and fall back
+    // rather than requiring a kernel version.
+    let mark = |m: u64| unsafe {
         libc::fanotify_mark(
             fd,
             libc::FAN_MARK_ADD | libc::FAN_MARK_FILESYSTEM,
-            mask,
+            m,
             libc::AT_FDCWD,
             watch_cstr.as_ptr(),
         )
     };
+    let mut rc = mark(base_mask | libc::FAN_RENAME);
+    if rc < 0 {
+        eprintln!("whodidd: [fid] FAN_RENAME unavailable — renames stay two unlinked events");
+        rc = mark(base_mask);
+    }
     if rc < 0 {
         eprintln!(
             "fanotify_mark (fid) failed: {}",
@@ -526,6 +633,14 @@ fn fid_watcher(watch_path: String, log_path: String, table: ProcTable, graph: Sh
                 break;
             }
 
+            // One event can carry several info records. A plain
+            // create/delete has a single DFID_NAME; FAN_RENAME instead
+            // carries OLD_DFID_NAME and NEW_DFID_NAME, so both halves have
+            // to be collected before deciding what to record.
+            let mut dfid_name: Option<String> = None;
+            let mut old_name: Option<String> = None;
+            let mut new_name: Option<String> = None;
+
             let mut info_offset = meta.metadata_len as usize;
             while info_offset + hdr_size <= meta.event_len as usize {
                 let hdr = unsafe {
@@ -541,81 +656,74 @@ fn fid_watcher(watch_path: String, log_path: String, table: ProcTable, graph: Sh
                     break;
                 }
 
-                if hdr.info_type == libc::FAN_EVENT_INFO_TYPE_DFID_NAME {
-                    let fh_hdr_start = info_offset + hdr_size + fsid_size;
-                    if fh_hdr_start + 8 <= record_end {
-                        let handle_bytes = unsafe {
-                            std::ptr::read_unaligned(record_base.add(fh_hdr_start) as *const u32)
-                        };
-                        let handle_type = unsafe {
-                            std::ptr::read_unaligned(record_base.add(fh_hdr_start + 4) as *const i32)
-                        };
-                        let f_handle_start = fh_hdr_start + 8;
-                        let name_start = f_handle_start + handle_bytes as usize;
-
-                        if name_start <= record_end {
-                            let mut name_end = name_start;
-                            while name_end < record_end
-                                && unsafe { *record_base.add(name_end) } != 0
-                            {
-                                name_end += 1;
-                            }
-                            let filename = unsafe {
-                                String::from_utf8_lossy(std::slice::from_raw_parts(
-                                    record_base.add(name_start),
-                                    name_end - name_start,
-                                ))
-                                .into_owned()
-                            };
-
-                            let mut fh_buf = vec![0u8; 8 + handle_bytes as usize];
-                            fh_buf[0..4].copy_from_slice(&handle_bytes.to_ne_bytes());
-                            fh_buf[4..8].copy_from_slice(&handle_type.to_ne_bytes());
-                            let raw_handle = unsafe {
-                                std::slice::from_raw_parts(
-                                    record_base.add(f_handle_start),
-                                    handle_bytes as usize,
-                                )
-                            };
-                            fh_buf[8..].copy_from_slice(raw_handle);
-
-                            let dir_fd = unsafe {
-                                libc::open_by_handle_at(
-                                    mount_fd,
-                                    fh_buf.as_mut_ptr() as *mut libc::file_handle,
-                                    libc::O_RDONLY,
-                                )
-                            };
-                            if dir_fd >= 0 {
-                                let parent = std::fs::read_link(format!("/proc/self/fd/{dir_fd}"));
-                                unsafe {
-                                    libc::close(dir_fd);
-                                }
-                                if let Ok(parent) = parent {
-                                    let full_path = if filename.is_empty() {
-                                        parent.to_string_lossy().into_owned()
-                                    } else {
-                                        format!("{}/{}", parent.display(), filename)
-                                    };
-                                    if !is_blocked(&full_path) && !is_self(meta.pid) {
-                                        log_event(
-                                            &mut log,
-                                            &full_path,
-                                            op_name(meta.mask),
-                                            meta.pid,
-                                            &table,
-                                            &graph,
-                                        );
-                                    }
-                                }
-                            }
-                            // stale handle (parent already gone by the time
-                            // we process this) — best-effort, skip silently
-                        }
-                    }
+                let slot = match hdr.info_type {
+                    libc::FAN_EVENT_INFO_TYPE_DFID_NAME => Some(&mut dfid_name),
+                    FAN_EVENT_INFO_TYPE_OLD_DFID_NAME => Some(&mut old_name),
+                    FAN_EVENT_INFO_TYPE_NEW_DFID_NAME => Some(&mut new_name),
+                    _ => None,
+                };
+                if let Some(slot) = slot {
+                    *slot = unsafe {
+                        resolve_dfid_name(
+                            record_base,
+                            info_offset,
+                            record_end,
+                            hdr_size,
+                            fsid_size,
+                            mount_fd,
+                        )
+                    };
                 }
 
                 info_offset = record_end;
+            }
+
+            if !is_self(meta.pid) {
+                match (old_name, new_name) {
+                    // A rename reported atomically: one event, both ends.
+                    // Recorded as a single "renamed" so blame can say what
+                    // it actually was, rather than two events with nothing
+                    // linking them.
+                    (Some(from), Some(to)) => {
+                        if !is_blocked(&to) {
+                            log_event_full(
+                                &mut log,
+                                &to,
+                                "renamed",
+                                meta.pid,
+                                Some(from.as_str()),
+                                &table,
+                                &graph,
+                            );
+                        }
+                    }
+                    // Only one half survived — treat it as the plain move
+                    // it would have been without FAN_RENAME.
+                    (Some(from), None) => {
+                        if !is_blocked(&from) {
+                            log_event(&mut log, &from, "moved_from", meta.pid, &table, &graph);
+                        }
+                    }
+                    (None, Some(to)) => {
+                        if !is_blocked(&to) {
+                            log_event(&mut log, &to, "moved_to", meta.pid, &table, &graph);
+                        }
+                    }
+                    (None, None) => {
+                        if let Some(path) = dfid_name
+                            && !is_blocked(&path)
+                        {
+                            log_event(
+                                &mut log,
+                                &path,
+                                op_name(meta.mask),
+                                meta.pid,
+                                &table,
+                                &graph,
+                            );
+                        }
+                    }
+                }
             }
 
             if meta.fd >= 0 {

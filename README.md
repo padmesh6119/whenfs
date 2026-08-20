@@ -129,12 +129,14 @@ the command began, not to some intermediate value the command produced.
 Re-applying is safe — a file already removed is the desired end state, not
 an error.
 
-**Renames need no special handling.** `mv a b` emits `moved_from(a)` and
-`moved_to(b)`. Nothing in the planner knows what a rename is, and it does
-not need to: `a` existed before the command so it is restored, `b` did not
-so it is removed, and the pair reconstitutes the original state. fanotify's
-missing rename cookie is a problem for *describing* the change, never for
-reversing it.
+**Renames reverse correctly in both forms.** `mv a b` reported as two
+events (`moved_from(a)`, `moved_to(b)`) needs no special handling at all:
+`a` existed before the command so it is restored, `b` did not so it is
+removed, and the pair reconstitutes the original state without the planner
+knowing what a rename is. Reported atomically by `FAN_RENAME` it arrives as
+one event naming both ends, which the planner expands back into those same
+two touches — handling only the destination would leave the source
+deleted.
 
 **Undo granularity is bounded by snapshot cadence.** The pre-image is the
 newest snapshot *predating* the command — so anything changed after the
@@ -288,12 +290,13 @@ Correctness properties covered by tests (`cargo test --lib`):
   ancestors-with-writers invariant holding in practice. `tree` lists
   exactly the writers and their ancestors: no `sleep`, no `basename`, no
   `grep`, because those touch no files and never reach the graph.
-- **No rename-cookie correlation.** fanotify doesn't pair `FAN_MOVED_FROM`
-  with its matching `FAN_MOVED_TO` the way inotify does; each is logged as
-  an independent event rather than one "renamed X to Y" record. This
-  affects *describing* a change, not undoing one — see below. (`FAN_RENAME`
-  on Linux 5.17+ reports both halves in a single event and would fix the
-  description; not implemented.)
+- **Renames need `FAN_RENAME` (Linux 5.17+) to be described as renames.**
+  fanotify has no cookie pairing `FAN_MOVED_FROM` with its `FAN_MOVED_TO`,
+  so without `FAN_RENAME` a rename is two events with nothing linking them.
+  The daemon requests `FAN_RENAME` and falls back to the older pair if the
+  kernel rejects it — requesting an unsupported bit fails the whole mark,
+  so this cannot be assumed. With it, `blame` reports `renamed from X`;
+  without it, undo still works either way (see Undo).
 - **Proc-connector narrows the exit race, doesn't close it.** Live-verified
   in both directions on the same run: a real `mv`'s identity, empty before
   the connector existed, is now fully captured including complete cmdline.
