@@ -36,6 +36,14 @@
 //      you ran that install script" — and it's the primitive the whole
 //      causal graph (see whenfs::graph) is built on.
 //
+//      All three event types update only the in-memory tree. This machine
+//      was measured at 16.8 forks/second at idle — 1.45 million a day, and
+//      at 193 bytes a row that is 267 MiB/day of process table before a
+//      single file event is recorded. Almost none of those processes ever
+//      touch a file, so a process is written to SQLite the first time it
+//      (or a descendant) produces a write worth attributing, together with
+//      its unpersisted ancestors so blame still explains it.
+//
 // Two sinks, by design. The JSONL log is the append-only audit trail and
 // what `whodid` reads; the SQLite graph beside it is the queryable index
 // `chronicle` reads, holding the process tree and file events as a real
@@ -175,8 +183,17 @@ fn read_ppid(pid: i32) -> Option<i32> {
 /// long-lived processes are attributable rather than anonymous. See
 /// Graph::record_existing for why the daemon's start time is used as
 /// their start_ts.
-fn bootstrap_process_table(graph: &SharedGraph, table: &ProcTable) {
-    let Some(g) = graph.as_ref() else { return };
+/// Seed the in-memory tree with every process already running.
+///
+/// Without this the daemon only knows processes that fork after startup,
+/// which on a real machine is a small minority of the things writing to
+/// disk -- every long-running service, editor and browser is invisible and
+/// their writes land unattributed.
+///
+/// Memory only: these are recorded on disk if and when one of them writes.
+/// Persisting all ~400 up front was measurably wasteful, and the same
+/// argument applies to them as to forks.
+fn bootstrap_process_table(table: &ProcTable) {
     let start_ts = whenfs::graph::now_ts();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         eprintln!("whodidd: [proc] cannot scan /proc; pre-existing processes stay anonymous");
@@ -184,6 +201,7 @@ fn bootstrap_process_table(graph: &SharedGraph, table: &ProcTable) {
     };
 
     let mut seeded = 0usize;
+    let mut map = table.lock().unwrap();
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -194,33 +212,32 @@ fn bootstrap_process_table(graph: &SharedGraph, table: &ProcTable) {
         let comm = read_proc_str(pid, "comm");
         let exe = read_exe(pid);
         let cmdline = read_cmdline(pid);
-        let uid = read_uid(pid);
         // A process that vanished mid-scan leaves nothing worth recording.
         if comm.is_empty() && exe.is_empty() && cmdline.is_empty() {
             continue;
         }
-        let id = whenfs::graph::Identity {
-            exe: &exe,
-            comm: &comm,
-            cmdline: &cmdline,
-            uid,
-        };
-        if g.record_existing(pid, read_ppid(pid), id, &start_ts)
-            .is_ok()
-        {
-            seeded += 1;
-            table.lock().unwrap().insert(
-                pid,
-                ProcInfo {
+        map.insert(
+            pid,
+            ProcNode {
+                ppid: read_ppid(pid),
+                // The daemon's start time, not the process's true birth:
+                // "existed as of daemon start" is all that can honestly be
+                // asserted, and it satisfies start_ts <= event_ts for every
+                // event that follows.
+                start_ts: start_ts.clone(),
+                info: ProcInfo {
                     exe,
                     comm,
                     cmdline,
-                    uid,
+                    uid: read_uid(pid),
                 },
-            );
-        }
+                exited: None,
+                persisted: false,
+            },
+        );
+        seeded += 1;
     }
-    eprintln!("whodidd: [graph] seeded {seeded} already-running processes");
+    eprintln!("whodidd: [graph] tracking {seeded} already-running processes");
 }
 
 fn open_log(log_path: &str) -> File {
@@ -244,7 +261,103 @@ struct ProcInfo {
     uid: u32,
 }
 
-type ProcTable = Arc<Mutex<HashMap<i32, ProcInfo>>>;
+/// A process as the daemon knows it, held in memory until something makes
+/// it worth writing down.
+#[derive(Clone)]
+struct ProcNode {
+    ppid: Option<i32>,
+    start_ts: String,
+    info: ProcInfo,
+    exited: Option<String>,
+    /// Persisted implies *every ancestor* was persisted in the same pass,
+    /// which is what lets the walk in `persist_chain` stop here instead of
+    /// climbing to init on every single write.
+    persisted: bool,
+}
+
+/// The in-memory process tree.
+///
+/// Everything forks. This machine was measured at 16.8 forks/second at
+/// idle -- 1.45 million a day, and at 193 bytes a row that is 267 MiB/day
+/// or 7.8 GiB/month of process table alone, before a single file event.
+/// Writing every fork to SQLite is simply not viable for something meant
+/// to run unattended.
+///
+/// The overwhelming majority of those processes never touch a file. So the
+/// tree lives here, cheaply, and a process is persisted only when it (or a
+/// descendant) actually produces a write that needs attributing -- along
+/// with its ancestors, so `blame` can still explain it. Memory stays
+/// bounded by evicting processes that exited a while ago and never wrote.
+type ProcTable = Arc<Mutex<HashMap<i32, ProcNode>>>;
+
+/// How long an exited process stays in memory before eviction.
+///
+/// Not arbitrary: fanotify and the netlink connector are separate sockets
+/// on separate threads, and a write can be processed well after its
+/// author's exit has been recorded. This window is what keeps such a write
+/// attributable, and it is generous because the cost is a few thousand
+/// small structs.
+const EXITED_GRACE_SECS: i64 = 90;
+
+/// Persist `pid` and any unpersisted ancestors, root-first so parent rows
+/// exist before the children that reference them. Returns the start_ts the
+/// event should bind to.
+fn persist_chain(table: &ProcTable, graph: &Graph, pid: i32) -> Option<String> {
+    let mut chain: Vec<(i32, ProcNode)> = Vec::new();
+    let own_start;
+    {
+        let map = table.lock().unwrap();
+        let mut cur = pid;
+        own_start = map.get(&cur).map(|n| n.start_ts.clone());
+        // Climbing stops at the first already-persisted ancestor: by the
+        // invariant above, everything beyond it is already on disk.
+        for _ in 0..64 {
+            let Some(node) = map.get(&cur) else { break };
+            if node.persisted {
+                break;
+            }
+            chain.push((cur, node.clone()));
+            match node.ppid {
+                Some(p) if p != cur => cur = p,
+                _ => break,
+            }
+        }
+    }
+
+    for (cpid, node) in chain.iter().rev() {
+        let id = whenfs::graph::Identity {
+            exe: &node.info.exe,
+            comm: &node.info.comm,
+            cmdline: &node.info.cmdline,
+            uid: node.info.uid,
+        };
+        if graph
+            .record_existing(*cpid, node.ppid, id, &node.start_ts)
+            .is_ok()
+        {
+            if let Some(exit) = node.exited.as_deref() {
+                let _ = graph.record_exit_at(*cpid, &node.start_ts, exit);
+            }
+            if let Some(n) = table.lock().unwrap().get_mut(cpid) {
+                n.persisted = true;
+            }
+        }
+    }
+    own_start
+}
+
+/// Drop processes that exited more than EXITED_GRACE_SECS ago. Persisted
+/// ones are safe to forget -- they are on disk, and the stop-at-persisted
+/// invariant means a later descendant still links to them correctly.
+fn evict_stale(table: &ProcTable) {
+    let cutoff = whenfs::time_expr::format_snapshot_name(
+        Local::now() - chrono::Duration::seconds(EXITED_GRACE_SECS),
+    );
+    table
+        .lock()
+        .unwrap()
+        .retain(|_, n| n.exited.as_deref().is_none_or(|e| e >= cutoff.as_str()));
+}
 
 /// Optional so the daemon degrades to its previous, live-verified
 /// JSONL-only behaviour if the graph database can't be opened, rather
@@ -263,11 +376,16 @@ fn log_event(
     // file is the append-only audit trail (proven, and what `whodid`
     // reads), the graph is the queryable index built from it. Log plus
     // materialised view.
+    //
+    // A write is the moment a process stops being a statistic and becomes
+    // worth recording, so the chain is persisted here rather than at fork
+    // time -- see ProcTable for why that distinction is load-bearing.
     if let Some(g) = graph.as_ref() {
+        persist_chain(table, g, pid);
         let _ = g.record_event(path, op, pid);
     }
     let (exe, comm, cmdline, uid) = {
-        let cached = table.lock().unwrap().get(&pid).cloned();
+        let cached = table.lock().unwrap().get(&pid).map(|n| n.info.clone());
         match cached {
             Some(info) => (info.exe, info.comm, info.cmdline, info.uid),
             // Fallback for any process the connector never saw exec (it
@@ -706,9 +824,19 @@ fn proc_connector(table: ProcTable, graph: SharedGraph) {
             let parent_pid = process_pid;
             let child_pid =
                 unsafe { std::ptr::read_unaligned(buf.as_ptr().add(FORK_CHILD_OFF) as *const i32) };
-            if let Some(g) = graph.as_ref() {
-                let _ = g.record_fork(parent_pid, child_pid);
-            }
+            // Memory only. At the 16.8 forks/second measured on this
+            // machine at idle, writing each one to SQLite costs 267 MiB a
+            // day for processes that overwhelmingly never touch a file.
+            table.lock().unwrap().insert(
+                child_pid,
+                ProcNode {
+                    ppid: Some(parent_pid),
+                    start_ts: now_ts(),
+                    info: ProcInfo::default(),
+                    exited: None,
+                    persisted: false,
+                },
+            );
         } else if what == libc::PROC_EVENT_EXEC {
             let info = ProcInfo {
                 exe: read_exe(process_pid),
@@ -716,16 +844,39 @@ fn proc_connector(table: ProcTable, graph: SharedGraph) {
                 cmdline: read_cmdline(process_pid),
                 uid: read_uid(process_pid),
             };
-            if let Some(g) = graph.as_ref() {
-                let _ = g.record_exec(process_pid, &info.exe, &info.comm, &info.cmdline, info.uid);
+            // exec replaces the image, not the process: keep the ppid and
+            // start_ts recorded at fork so the lineage edge survives.
+            let mut map = table.lock().unwrap();
+            match map.get_mut(&process_pid) {
+                Some(node) => node.info = info,
+                None => {
+                    map.insert(
+                        process_pid,
+                        ProcNode {
+                            ppid: read_ppid(process_pid),
+                            start_ts: now_ts(),
+                            info,
+                            exited: None,
+                            persisted: false,
+                        },
+                    );
+                }
             }
-            table.lock().unwrap().insert(process_pid, info);
         } else if what == libc::PROC_EVENT_EXIT {
-            // Must evict, not just leave stale: pids get reused, and a
-            // stale entry would misattribute a later, unrelated process.
-            table.lock().unwrap().remove(&process_pid);
-            if let Some(g) = graph.as_ref() {
-                let _ = g.record_exit(process_pid);
+            // Marked, not removed. A write by this process can still be
+            // sitting unprocessed in the fanotify queue, and dropping the
+            // entry now is exactly how short-lived writers lost their
+            // identity before. evict_stale() clears it once the window in
+            // which that can happen has passed.
+            let exit_ts = now_ts();
+            let mut map = table.lock().unwrap();
+            if let Some(node) = map.get_mut(&process_pid) {
+                node.exited = Some(exit_ts.clone());
+                if node.persisted
+                    && let Some(g) = graph.as_ref()
+                {
+                    let _ = g.record_exit_at(process_pid, &node.start_ts, &exit_ts);
+                }
             }
         }
     }
@@ -762,7 +913,19 @@ fn main() {
     };
 
     let table: ProcTable = Arc::new(Mutex::new(HashMap::new()));
-    bootstrap_process_table(&graph, &table);
+    bootstrap_process_table(&table);
+
+    // Bounds the in-memory tree. At ~17 forks/second and a 90s grace this
+    // settles around a couple of thousand small structs.
+    {
+        let t = table.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_secs(30));
+                evict_stale(&t);
+            }
+        });
+    }
 
     let proc_conn = {
         let t = table.clone();

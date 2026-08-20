@@ -262,10 +262,24 @@ Correctness properties covered by tests (`cargo test --lib`):
   as far as the oldest surviving ancestor. That is the cost of bounded
   history rather than a defect, but it is a real tradeoff to choose
   deliberately.
-- **Recording every fork is untested at scale.** A busy machine forks
-  constantly. Process rows are small and the edge is essential, but growth
-  under real load is unmeasured -- and the one measurement taken so far was
-  dominated by the feedback loop above, so it says nothing useful yet.
+- **Fork volume, measured, and what it forced.** `/proc/stat`'s fork
+  counter puts this machine at **16.8 forks/second at idle** — 1.45 million
+  a day. At a measured 193 bytes per row that is **267 MiB/day, 7.8 GiB a
+  month** of process table alone, before a single file event. Recording
+  every fork is simply not viable unattended.
+
+  Nearly all of those processes never touch a file, so the tree now lives
+  in memory and a process is written to SQLite the first time it or a
+  descendant produces a write worth attributing — along with its
+  unpersisted ancestors, so `blame` still explains it. Processes that
+  exited and never wrote are evicted after a grace window, which exists
+  because fanotify and the connector are separate sockets: a write can
+  still arrive after its author's exit was recorded, and dropping the entry
+  early is exactly how short-lived writers lost their identity before.
+
+  **Not yet live-verified.** The design follows from a real measurement,
+  but every previous change here that looked correct in tests still failed
+  its first contact with real kernel traffic.
 - **No rename-cookie correlation.** fanotify doesn't pair `FAN_MOVED_FROM`
   with its matching `FAN_MOVED_TO` the way inotify does; each is logged as
   an independent event rather than one "renamed X to Y" record. This

@@ -221,6 +221,23 @@ impl Graph {
         Ok(())
     }
 
+    /// Record an exit for one specific incarnation.
+    ///
+    /// `record_exit` targets whichever incarnation is currently live, which
+    /// is right when the connector reports an exit as it happens. Lazy
+    /// persistence needs the other shape: a process is written to disk only
+    /// once it matters, often *after* it already exited, so the exit time
+    /// has to be attached to the incarnation being written rather than
+    /// looked up.
+    pub fn record_exit_at(&self, pid: i32, start_ts: &str, exit_ts: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE processes SET exit_ts = ?1 WHERE pid = ?2 AND start_ts = ?3",
+            params![exit_ts, pid, start_ts],
+        )?;
+        Ok(())
+    }
+
     /// Bind a file event to the live incarnation of `pid`. `proc_start` may
     /// be NULL when the writer was never seen forking or execing (already
     /// running before the daemon started, or gone before we could look) —
