@@ -70,6 +70,22 @@ See `../ARCHITECTURE.md` for the full design and rationale.
     anything outside the snapshotted tree, where a missing pre-image would
     otherwise be "restored" by deletion.
   - `stat` — graph size.
+- `snapshot.sh` — three interchangeable backends via `SNAPSHOT_MODE`, all
+  live-verified: `hardlink` (default, `cp -al`, any filesystem, no
+  privilege), `full` (`cp -a`, real independent copy, small trees only),
+  `btrfs` (`btrfs subvolume snapshot -r`, true copy-on-write — confirmed a
+  post-snapshot edit to the live tree cannot retroactively touch a
+  snapshot, the property the other two modes can't give you).
+- `snapshot-loop.sh` — runs `snapshot.sh` on an interval; the process a
+  service supervisor (runit) will own later.
+- `demo.sh` — builds a fresh lab, takes real snapshots across real time
+  gaps, and runs every command above end-to-end, finishing with a
+  throwaway installer under `trace` and then `revert`-ing it.
+- `btrfs-test.sh` — same shape as `demo.sh`, verifying the `btrfs` backend
+  against a real loopback btrfs volume. Builds unprivileged, then
+  re-execs itself under `sudo` for the mount step only (the loopback mount
+  itself needs `CAP_SYS_ADMIN`) — just run `./btrfs-test.sh`, no `sudo`
+  prefix needed, it self-elevates and prompts at the right point.
 
 ## Undo
 
@@ -123,21 +139,6 @@ removed before `a/b`. Directories are removed with `remove_dir`, never
 `remove_dir_all`: a directory the command created but that now holds files
 it did not is **kept**, and reported as kept rather than failed. Recursive
 deletion there would destroy exactly the data the undo exists to protect.
-- `snapshot.sh` — three interchangeable backends via `SNAPSHOT_MODE`, all
-  live-verified: `hardlink` (default, `cp -al`, any filesystem, no
-  privilege), `full` (`cp -a`, real independent copy, small trees only),
-  `btrfs` (`btrfs subvolume snapshot -r`, true copy-on-write — confirmed a
-  post-snapshot edit to the live tree cannot retroactively touch a
-  snapshot, the property the other two modes can't give you).
-- `snapshot-loop.sh` — runs `snapshot.sh` on an interval; the process a
-  service supervisor (runit) will own later.
-- `demo.sh` — builds a fresh lab, takes real snapshots across real time
-  gaps, and runs every command above end-to-end.
-- `btrfs-test.sh` — same shape as `demo.sh`, verifying the `btrfs` backend
-  against a real loopback btrfs volume. Builds unprivileged, then
-  re-execs itself under `sudo` for the mount step only (the loopback mount
-  itself needs `CAP_SYS_ADMIN`) — just run `./btrfs-test.sh`, no `sudo`
-  prefix needed, it self-elevates and prompts at the right point.
 
 ## Try it
 
