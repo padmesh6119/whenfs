@@ -103,6 +103,13 @@ the command began, not to some intermediate value the command produced.
 
 Re-applying is safe — a file already removed is the desired end state, not
 an error.
+
+Removals run deepest-first, because a command that ran `mkdir -p a/b`
+produces create events with the parent listed first, and `a` cannot be
+removed before `a/b`. Directories are removed with `remove_dir`, never
+`remove_dir_all`: a directory the command created but that now holds files
+it did not is **kept**, and reported as kept rather than failed. Recursive
+deletion there would destroy exactly the data the undo exists to protect.
 - `snapshot.sh` — three interchangeable backends via `SNAPSHOT_MODE`, all
   live-verified: `hardlink` (default, `cp -al`, any filesystem, no
   privilege), `full` (`cp -a`, real independent copy, small trees only),

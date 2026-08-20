@@ -397,7 +397,7 @@ fn cmd_revert(g: &Graph, pid_arg: &str, snap_root: &Path, live_root: &Path, appl
         return;
     }
 
-    let (mut ok, mut failed) = (0, 0);
+    let (mut ok, mut failed, mut kept) = (0, 0, 0);
     for st in &steps {
         let r = match st {
             Step::Restore { path, from } => path
@@ -405,22 +405,59 @@ fn cmd_revert(g: &Graph, pid_arg: &str, snap_root: &Path, live_root: &Path, appl
                 .map(std::fs::create_dir_all)
                 .unwrap_or(Ok(()))
                 .and_then(|_| std::fs::copy(from, path).map(|_| ())),
-            Step::Remove { path } => match std::fs::remove_file(path) {
-                // Already gone is the desired end state, not a failure.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                other => other,
-            },
+            Step::Remove { path } => {
+                // A command that ran `mkdir -p` created directories, and
+                // unlink does not remove those. remove_dir (never
+                // remove_dir_all) is the right tool: it refuses a
+                // non-empty directory, which is exactly the desired
+                // behaviour when something the command did not create is
+                // sitting inside one it did.
+                let is_dir = std::fs::symlink_metadata(path)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                let r = if is_dir {
+                    std::fs::remove_dir(path)
+                } else {
+                    std::fs::remove_file(path)
+                };
+                match r {
+                    // Already gone is the desired end state, not a failure.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    other => other,
+                }
+            }
             Step::Skip { .. } => continue,
         };
         match r {
             Ok(()) => ok += 1,
             Err(e) => {
-                failed += 1;
-                eprintln!("  {YELLOW}failed{RESET} {}: {e}", st.path().display());
+                // A directory left standing because it still holds files
+                // this command did not create is the guard working, not a
+                // fault -- reporting it as a failure would train the user
+                // to ignore real ones.
+                let non_empty = matches!(st, Step::Remove { .. })
+                    && st.path().is_dir()
+                    && std::fs::read_dir(st.path())
+                        .map(|mut d| d.next().is_some())
+                        .unwrap_or(false);
+                if non_empty {
+                    kept += 1;
+                    println!(
+                        "  {DIM}kept   {} — still holds files this command did not create{RESET}",
+                        st.path().display()
+                    );
+                } else {
+                    failed += 1;
+                    eprintln!("  {YELLOW}failed{RESET} {}: {e}", st.path().display());
+                }
             }
         }
     }
-    println!("  {ok} applied, {failed} failed");
+    if kept > 0 {
+        println!("  {ok} applied, {kept} kept (not empty), {failed} failed");
+    } else {
+        println!("  {ok} applied, {failed} failed");
+    }
 }
 
 fn cmd_stat(g: &Graph, db: &Path) {

@@ -143,7 +143,36 @@ pub fn plan(
             steps.push(Step::Remove { path });
         }
     }
-    steps
+
+    // Return in an order that is safe to apply top to bottom.
+    //
+    // Removals must run deepest-first: a command that ran `mkdir -p a/b`
+    // produces create events for both, and first-touch order lists the
+    // parent first -- so removing `a` before `a/b` cannot work. Sorting by
+    // path depth descending makes each directory empty before its own
+    // removal is attempted.
+    //
+    // Restores go first so that a file being restored into a directory the
+    // command created survives: the later attempt to remove that directory
+    // then fails as not-empty, which is the correct outcome rather than a
+    // race to see which wins.
+    let depth = |p: &Path| p.components().count();
+    let mut ordered: Vec<Step> = Vec::with_capacity(steps.len());
+    ordered.extend(
+        steps
+            .iter()
+            .filter(|s| matches!(s, Step::Restore { .. }))
+            .cloned(),
+    );
+    let mut removes: Vec<Step> = steps
+        .iter()
+        .filter(|s| matches!(s, Step::Remove { .. }))
+        .cloned()
+        .collect();
+    removes.sort_by(|a, b| depth(b.path()).cmp(&depth(a.path())));
+    ordered.extend(removes);
+    ordered.extend(steps.into_iter().filter(|s| matches!(s, Step::Skip { .. })));
+    ordered
 }
 
 #[cfg(test)]
@@ -242,6 +271,64 @@ mod tests {
             ),
             other => panic!("expected Restore, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn removals_are_ordered_deepest_first_so_directories_can_be_emptied() {
+        // `mkdir -p a/b` creates events for the parent first, but removing
+        // the parent before its child cannot work.
+        let root = lab();
+        let (snap_root, live) = (root.join("snap"), root.join("live"));
+        std::fs::create_dir_all(snap_root.join("2026-01-01T00-00-00")).unwrap();
+
+        let steps = plan(
+            &[
+                ev(&format!("{}/opt", live.display()), "2026-01-02T00-00-00"),
+                ev(
+                    &format!("{}/opt/thing", live.display()),
+                    "2026-01-02T00-00-00",
+                ),
+                ev(
+                    &format!("{}/opt/thing/bin", live.display()),
+                    "2026-01-02T00-00-00",
+                ),
+            ],
+            &["2026-01-01T00-00-00".into()],
+            &snap_root,
+            &live,
+        );
+        let paths: Vec<String> = steps
+            .iter()
+            .map(|s| s.path().to_string_lossy().into_owned())
+            .collect();
+        let idx = |suffix: &str| paths.iter().position(|p| p.ends_with(suffix)).unwrap();
+        assert!(
+            idx("opt/thing/bin") < idx("opt/thing") && idx("opt/thing") < idx("opt"),
+            "children must precede parents, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn restores_are_ordered_before_removals() {
+        let root = lab();
+        let (snap_root, live) = (root.join("snap"), root.join("live"));
+        let snap = snap_root.join("2026-01-01T00-00-00");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("kept.conf"), "old").unwrap();
+
+        let steps = plan(
+            &[
+                ev(&format!("{}/made", live.display()), "2026-01-02T00-00-00"),
+                ev(
+                    &format!("{}/kept.conf", live.display()),
+                    "2026-01-02T00-00-00",
+                ),
+            ],
+            &["2026-01-01T00-00-00".into()],
+            &snap_root,
+            &live,
+        );
+        assert!(matches!(steps[0], Step::Restore { .. }), "{:?}", steps);
     }
 
     #[test]
