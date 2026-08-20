@@ -66,7 +66,6 @@
 // usage: whodidd <watch-path> <log-path>
 
 use chrono::Local;
-use std::collections::HashMap;
 use std::env;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -77,6 +76,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use whenfs::graph::Graph;
+use whenfs::proctree::{ProcInfo, ProcTree};
 
 /// Event timestamps use the exact same format as snapshot directory names
 /// (whenfs::time_expr::SNAPSHOT_FMT), Local time. This makes them directly,
@@ -201,7 +201,7 @@ fn bootstrap_process_table(table: &ProcTable) {
     };
 
     let mut seeded = 0usize;
-    let mut map = table.lock().unwrap();
+    let mut tree = table.lock().unwrap();
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -216,24 +216,20 @@ fn bootstrap_process_table(table: &ProcTable) {
         if comm.is_empty() && exe.is_empty() && cmdline.is_empty() {
             continue;
         }
-        map.insert(
+        // start_ts is the daemon's start time, not the process's true
+        // birth: "existed as of daemon start" is all that can honestly be
+        // asserted, and it satisfies start_ts <= event_ts for everything
+        // that follows.
+        tree.seed(
             pid,
-            ProcNode {
-                ppid: read_ppid(pid),
-                // The daemon's start time, not the process's true birth:
-                // "existed as of daemon start" is all that can honestly be
-                // asserted, and it satisfies start_ts <= event_ts for every
-                // event that follows.
-                start_ts: start_ts.clone(),
-                info: ProcInfo {
-                    exe,
-                    comm,
-                    cmdline,
-                    uid: read_uid(pid),
-                },
-                exited: None,
-                persisted: false,
+            read_ppid(pid),
+            ProcInfo {
+                exe,
+                comm,
+                cmdline,
+                uid: read_uid(pid),
             },
+            &start_ts,
         );
         seeded += 1;
     }
@@ -248,47 +244,12 @@ fn open_log(log_path: &str) -> File {
         .expect("cannot open log file")
 }
 
-/// Identity captured at PROC_EVENT_EXEC time, when the process is
-/// guaranteed alive — see `proc_connector` below. Confirmed live (previous
-/// session) that reading /proc/<pid> at arbitrary-delay event-processing
-/// time can lose this if the process already exited; this table exists to
-/// avoid that read entirely for any process the connector saw exec.
-#[derive(Clone, Default)]
-struct ProcInfo {
-    exe: String,
-    comm: String,
-    cmdline: String,
-    uid: u32,
-}
-
-/// A process as the daemon knows it, held in memory until something makes
-/// it worth writing down.
-#[derive(Clone)]
-struct ProcNode {
-    ppid: Option<i32>,
-    start_ts: String,
-    info: ProcInfo,
-    exited: Option<String>,
-    /// Persisted implies *every ancestor* was persisted in the same pass,
-    /// which is what lets the walk in `persist_chain` stop here instead of
-    /// climbing to init on every single write.
-    persisted: bool,
-}
-
-/// The in-memory process tree.
-///
-/// Everything forks. This machine was measured at 16.8 forks/second at
-/// idle -- 1.45 million a day, and at 193 bytes a row that is 267 MiB/day
-/// or 7.8 GiB/month of process table alone, before a single file event.
-/// Writing every fork to SQLite is simply not viable for something meant
-/// to run unattended.
-///
-/// The overwhelming majority of those processes never touch a file. So the
-/// tree lives here, cheaply, and a process is persisted only when it (or a
-/// descendant) actually produces a write that needs attributing -- along
-/// with its ancestors, so `blame` can still explain it. Memory stays
-/// bounded by evicting processes that exited a while ago and never wrote.
-type ProcTable = Arc<Mutex<HashMap<i32, ProcNode>>>;
+/// The process tree and its invariants live in `whenfs::proctree`, where
+/// they can be tested without a kernel or a database -- see that module for
+/// why persistence is deferred until a process actually writes, and for the
+/// two invariants (`persisted` implies persisted ancestors; exit marks
+/// rather than removes) that the code below relies on.
+type ProcTable = Arc<Mutex<ProcTree>>;
 
 /// How long an exited process stays in memory before eviction.
 ///
@@ -299,32 +260,11 @@ type ProcTable = Arc<Mutex<HashMap<i32, ProcNode>>>;
 /// small structs.
 const EXITED_GRACE_SECS: i64 = 90;
 
-/// Persist `pid` and any unpersisted ancestors, root-first so parent rows
-/// exist before the children that reference them. Returns the start_ts the
-/// event should bind to.
-fn persist_chain(table: &ProcTable, graph: &Graph, pid: i32) -> Option<String> {
-    let mut chain: Vec<(i32, ProcNode)> = Vec::new();
-    let own_start;
-    {
-        let map = table.lock().unwrap();
-        let mut cur = pid;
-        own_start = map.get(&cur).map(|n| n.start_ts.clone());
-        // Climbing stops at the first already-persisted ancestor: by the
-        // invariant above, everything beyond it is already on disk.
-        for _ in 0..64 {
-            let Some(node) = map.get(&cur) else { break };
-            if node.persisted {
-                break;
-            }
-            chain.push((cur, node.clone()));
-            match node.ppid {
-                Some(p) if p != cur => cur = p,
-                _ => break,
-            }
-        }
-    }
-
-    for (cpid, node) in chain.iter().rev() {
+/// Write `pid` and any unpersisted ancestors to the graph, root-first so
+/// parent rows exist before the children referencing them.
+fn persist_chain(table: &ProcTable, graph: &Graph, pid: i32) {
+    let chain = table.lock().unwrap().unpersisted_chain(pid);
+    for (cpid, node) in &chain {
         let id = whenfs::graph::Identity {
             exe: &node.info.exe,
             comm: &node.info.comm,
@@ -335,28 +275,21 @@ fn persist_chain(table: &ProcTable, graph: &Graph, pid: i32) -> Option<String> {
             .record_existing(*cpid, node.ppid, id, &node.start_ts)
             .is_ok()
         {
+            // Already-exited processes are the common case here: lazy
+            // persistence usually writes a process down after it is gone.
             if let Some(exit) = node.exited.as_deref() {
                 let _ = graph.record_exit_at(*cpid, &node.start_ts, exit);
             }
-            if let Some(n) = table.lock().unwrap().get_mut(cpid) {
-                n.persisted = true;
-            }
+            table.lock().unwrap().mark_persisted(*cpid);
         }
     }
-    own_start
 }
 
-/// Drop processes that exited more than EXITED_GRACE_SECS ago. Persisted
-/// ones are safe to forget -- they are on disk, and the stop-at-persisted
-/// invariant means a later descendant still links to them correctly.
 fn evict_stale(table: &ProcTable) {
     let cutoff = whenfs::time_expr::format_snapshot_name(
         Local::now() - chrono::Duration::seconds(EXITED_GRACE_SECS),
     );
-    table
-        .lock()
-        .unwrap()
-        .retain(|_, n| n.exited.as_deref().is_none_or(|e| e >= cutoff.as_str()));
+    table.lock().unwrap().evict_stale(&cutoff);
 }
 
 /// Optional so the daemon degrades to its previous, live-verified
@@ -385,7 +318,7 @@ fn log_event(
         let _ = g.record_event(path, op, pid);
     }
     let (exe, comm, cmdline, uid) = {
-        let cached = table.lock().unwrap().get(&pid).map(|n| n.info.clone());
+        let cached = table.lock().unwrap().info(pid);
         match cached {
             Some(info) => (info.exe, info.comm, info.cmdline, info.uid),
             // Fallback for any process the connector never saw exec (it
@@ -827,16 +760,10 @@ fn proc_connector(table: ProcTable, graph: SharedGraph) {
             // Memory only. At the 16.8 forks/second measured on this
             // machine at idle, writing each one to SQLite costs 267 MiB a
             // day for processes that overwhelmingly never touch a file.
-            table.lock().unwrap().insert(
-                child_pid,
-                ProcNode {
-                    ppid: Some(parent_pid),
-                    start_ts: now_ts(),
-                    info: ProcInfo::default(),
-                    exited: None,
-                    persisted: false,
-                },
-            );
+            table
+                .lock()
+                .unwrap()
+                .on_fork(parent_pid, child_pid, &now_ts());
         } else if what == libc::PROC_EVENT_EXEC {
             let info = ProcInfo {
                 exe: read_exe(process_pid),
@@ -844,24 +771,13 @@ fn proc_connector(table: ProcTable, graph: SharedGraph) {
                 cmdline: read_cmdline(process_pid),
                 uid: read_uid(process_pid),
             };
-            // exec replaces the image, not the process: keep the ppid and
-            // start_ts recorded at fork so the lineage edge survives.
-            let mut map = table.lock().unwrap();
-            match map.get_mut(&process_pid) {
-                Some(node) => node.info = info,
-                None => {
-                    map.insert(
-                        process_pid,
-                        ProcNode {
-                            ppid: read_ppid(process_pid),
-                            start_ts: now_ts(),
-                            info,
-                            exited: None,
-                            persisted: false,
-                        },
-                    );
-                }
-            }
+            // exec replaces the image, not the process: on_exec keeps the
+            // ppid and start_ts recorded at fork so the lineage edge
+            // survives. read_ppid only matters if the fork was missed.
+            table
+                .lock()
+                .unwrap()
+                .on_exec(process_pid, info, read_ppid(process_pid), &now_ts());
         } else if what == libc::PROC_EVENT_EXIT {
             // Marked, not removed. A write by this process can still be
             // sitting unprocessed in the fanotify queue, and dropping the
@@ -869,14 +785,12 @@ fn proc_connector(table: ProcTable, graph: SharedGraph) {
             // identity before. evict_stale() clears it once the window in
             // which that can happen has passed.
             let exit_ts = now_ts();
-            let mut map = table.lock().unwrap();
-            if let Some(node) = map.get_mut(&process_pid) {
-                node.exited = Some(exit_ts.clone());
-                if node.persisted
-                    && let Some(g) = graph.as_ref()
-                {
-                    let _ = g.record_exit_at(process_pid, &node.start_ts, &exit_ts);
-                }
+            let persisted_start = table.lock().unwrap().on_exit(process_pid, &exit_ts);
+            // Only a row already on disk needs its exit written through;
+            // an unpersisted one carries its exit in memory until (and if)
+            // something makes it worth recording.
+            if let (Some(start), Some(g)) = (persisted_start, graph.as_ref()) {
+                let _ = g.record_exit_at(process_pid, &start, &exit_ts);
             }
         }
     }
@@ -912,7 +826,7 @@ fn main() {
         }
     };
 
-    let table: ProcTable = Arc::new(Mutex::new(HashMap::new()));
+    let table: ProcTable = Arc::new(Mutex::new(ProcTree::new()));
     bootstrap_process_table(&table);
 
     // Bounds the in-memory tree. At ~17 forks/second and a 90s grace this
