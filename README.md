@@ -69,6 +69,10 @@ See `../ARCHITECTURE.md` for the full design and rationale.
     — that has to be undone *through* the package manager) and refuses
     anything outside the snapshotted tree, where a missing pre-image would
     otherwise be "restored" by deletion.
+  - `prune --before <when>` — drop history older than a time expression,
+    reusing the same `/when` grammar (`prune --before 30-days-ago`). Dry
+    run unless `--apply`; `--vacuum` returns the freed space to the disk
+    rather than leaving it for SQLite to reuse.
   - `stat` — graph size.
 - `snapshot.sh` — three interchangeable backends via `SNAPSHOT_MODE`, all
   live-verified: `hardlink` (default, `cp -al`, any filesystem, no
@@ -251,6 +255,13 @@ Correctness properties covered by tests (`cargo test --lib`):
   (`<unnamed>` -- known process, unknown identity, distinct from
   `<unattributed>` where no process is known at all). Their ancestry still
   explains the write completely.
+- **Retention is manual.** `chronicle prune` exists but nothing calls it;
+  the daemon has no built-in retention policy, so an unattended graph grows
+  without bound. Pruning also necessarily truncates ancestry chains that
+  reach back past the cutoff — a retained event may end up explained only
+  as far as the oldest surviving ancestor. That is the cost of bounded
+  history rather than a defect, but it is a real tradeoff to choose
+  deliberately.
 - **Recording every fork is untested at scale.** A busy machine forks
   constantly. Process rows are small and the edge is essential, but growth
   under real load is unmeasured -- and the one measurement taken so far was

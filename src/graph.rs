@@ -490,6 +490,60 @@ impl Graph {
         rows.collect()
     }
 
+    /// How much history predates `before_ts` — the dry run for `prune`.
+    pub fn prune_preview(&self, before_ts: &str) -> rusqlite::Result<(i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        let events: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE ts < ?1",
+            params![before_ts],
+            |r| r.get(0),
+        )?;
+        let procs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM processes p
+              WHERE p.exit_ts IS NOT NULL AND p.exit_ts < ?1
+                AND NOT EXISTS (SELECT 1 FROM events e
+                                 WHERE e.pid = p.pid AND e.ts >= ?1)",
+            params![before_ts],
+            |r| r.get(0),
+        )?;
+        Ok((procs, events))
+    }
+
+    /// Drop history older than `before_ts`.
+    ///
+    /// A process is kept if any *retained* event shares its pid, even when
+    /// that event's `proc_start` is NULL: lazy resolution means such an
+    /// event can still bind to it at query time, and deleting the row would
+    /// silently turn an attributed write back into an anonymous one. Being
+    /// over-retentive here costs a few rows; being under-retentive
+    /// destroys attribution that still has a live consumer.
+    ///
+    /// Pruning necessarily truncates ancestry chains that reach back past
+    /// the cutoff — a retained event may end up explained only as far as
+    /// the oldest surviving ancestor. That is the cost of bounded history,
+    /// not a defect.
+    pub fn prune(&self, before_ts: &str) -> rusqlite::Result<(i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        // Processes first, while the events that pin them still exist.
+        let procs = conn.execute(
+            "DELETE FROM processes
+              WHERE exit_ts IS NOT NULL AND exit_ts < ?1
+                AND NOT EXISTS (SELECT 1 FROM events e
+                                 WHERE e.pid = processes.pid AND e.ts >= ?1)",
+            params![before_ts],
+        )? as i64;
+        let events = conn.execute("DELETE FROM events WHERE ts < ?1", params![before_ts])? as i64;
+        Ok((procs, events))
+    }
+
+    /// Reclaim the space freed by a prune. Separate because it rewrites the
+    /// whole file and can take a while on a large database.
+    pub fn vacuum(&self) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
     pub fn counts(&self) -> rusqlite::Result<(i64, i64)> {
         let conn = self.conn.lock().unwrap();
         let procs: i64 = conn.query_row("SELECT COUNT(*) FROM processes", [], |r| r.get(0))?;
@@ -703,6 +757,74 @@ mod tests {
             g.latest_start_ts(900).unwrap().is_some(),
             "trace must still find the command it just ran"
         );
+    }
+
+    #[test]
+    fn prune_drops_old_history_but_keeps_what_retained_events_still_need() {
+        let g = mem_graph();
+        let old = "2020-01-01T00-00-00";
+        let new = "2030-01-01T00-00-00";
+        let cutoff = "2025-01-01T00-00-00";
+
+        // Fully historical: exited long ago, only old events.
+        g.record_existing(
+            10,
+            Some(1),
+            Identity {
+                exe: "/bin/old",
+                comm: "old",
+                cmdline: "old",
+                uid: 0,
+            },
+            old,
+        )
+        .unwrap();
+        {
+            let c = g.conn.lock().unwrap();
+            c.execute("UPDATE processes SET exit_ts=?1 WHERE pid=10", params![old])
+                .unwrap();
+            c.execute(
+                "INSERT INTO events (ts,path,op,pid,proc_start) VALUES (?1,'/tmp/a','create',10,?1)",
+                params![old],
+            )
+            .unwrap();
+            // Long-exited, but a retained event still names its pid.
+            c.execute(
+                "INSERT INTO processes (pid,start_ts,ppid,exe,comm,cmdline,uid,exit_ts)
+                 VALUES (20,?1,1,'/bin/keep','keep','keep',0,?1)",
+                params![old],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO events (ts,path,op,pid,proc_start) VALUES (?1,'/tmp/b','create',20,NULL)",
+                params![new],
+            )
+            .unwrap();
+        }
+
+        let (p_prev, e_prev) = g.prune_preview(cutoff).unwrap();
+        assert_eq!(e_prev, 1, "one event predates the cutoff");
+        assert_eq!(p_prev, 1, "only the process with no retained events");
+
+        let (procs, events) = g.prune(cutoff).unwrap();
+        assert_eq!((procs, events), (1, 1));
+
+        let c = g.conn.lock().unwrap();
+        let kept: i64 = c
+            .query_row("SELECT COUNT(*) FROM processes WHERE pid=20", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            kept, 1,
+            "a process a retained event can still bind to must survive"
+        );
+        let gone: i64 = c
+            .query_row("SELECT COUNT(*) FROM processes WHERE pid=10", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(gone, 0);
     }
 
     #[test]

@@ -460,6 +460,56 @@ fn cmd_revert(g: &Graph, pid_arg: &str, snap_root: &Path, live_root: &Path, appl
     }
 }
 
+/// Drop history older than a time expression.
+///
+/// Dry run unless `--apply`, for the same reason revert is: this destroys
+/// history, and history is the only thing here that cannot be recomputed.
+fn cmd_prune(g: &Graph, expr: &str, apply: bool, vacuum: bool) {
+    // Reuses the /when path grammar, so retention reads the way the rest of
+    // the system already does: `prune --before 30-days-ago`.
+    let Some(target) = whenfs::time_expr::resolve_target(expr, chrono::Local::now()) else {
+        eprintln!("not a time expression: {expr}  (try: 30-days-ago, last-month, 2026-01-01)");
+        return;
+    };
+    let cutoff = whenfs::time_expr::format_snapshot_name(target);
+
+    let (procs, events) = match g.prune_preview(&cutoff) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("query failed: {e}");
+            return;
+        }
+    };
+    let (have_p, have_e) = g.counts().unwrap_or((0, 0));
+
+    println!(
+        "\n{BOLD}{}{RESET} history before {CYAN}{cutoff}{RESET}",
+        if apply { "pruning" } else { "dry run —" }
+    );
+    println!("  {events} of {have_e} events");
+    println!("  {procs} of {have_p} processes");
+    if !apply {
+        println!("  {DIM}dry run: nothing was deleted. Re-run with --apply.{RESET}");
+        return;
+    }
+    match g.prune(&cutoff) {
+        Ok((p, e)) => println!("  deleted {e} events, {p} processes"),
+        Err(e) => {
+            eprintln!("prune failed: {e}");
+            return;
+        }
+    }
+    if vacuum {
+        print!("  reclaiming space... ");
+        match g.vacuum() {
+            Ok(()) => println!("done"),
+            Err(e) => println!("failed: {e}"),
+        }
+    } else {
+        println!("  {DIM}space is reused, not returned to the disk — add --vacuum for that{RESET}");
+    }
+}
+
 fn cmd_stat(g: &Graph, db: &Path) {
     match g.counts() {
         Ok((procs, events)) => {
@@ -480,6 +530,8 @@ fn usage() -> ! {
   chronicle trace -- <cmd>   run a command, report every file it touched
   chronicle revert <pid>     undo a traced command (dry run unless --apply)
                              needs --snap <dir> --live <dir>
+  chronicle prune --before <when>   drop history older than that
+                             (dry run unless --apply; --vacuum reclaims)
   chronicle stat             graph size
 
   --db <path>                database location
@@ -496,6 +548,8 @@ fn main() {
     let mut snap_arg: Option<String> = None;
     let mut live_arg: Option<String> = None;
     let mut apply = false;
+    let mut vacuum = false;
+    let mut before_arg: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 1;
     while i < argv.len() {
@@ -522,6 +576,14 @@ fn main() {
             "--apply" => {
                 apply = true;
                 i += 1;
+            }
+            "--vacuum" => {
+                vacuum = true;
+                i += 1;
+            }
+            "--before" if i + 1 < argv.len() => {
+                before_arg = Some(argv[i + 1].clone());
+                i += 2;
             }
             _ => {
                 rest.push(argv[i].clone());
@@ -558,6 +620,13 @@ Looked for: $WHENFS_GRAPH, ./graph.db, /var/lib/whenfs/graph.db"
         ("blame", 2) => cmd_blame(&g, &rest[1]),
         ("tree", 2) => cmd_tree(&g, &rest[1]),
         ("stat", 1) => cmd_stat(&g, &db),
+        ("prune", 1) => {
+            let Some(before) = before_arg.as_deref() else {
+                eprintln!("prune needs --before <time-expression>, e.g. 30-days-ago");
+                std::process::exit(1);
+            };
+            cmd_prune(&g, before, apply, vacuum);
+        }
         ("revert", 2) => {
             let (Some(snap), Some(live)) = (snap_arg.as_deref(), live_arg.as_deref()) else {
                 eprintln!("revert needs --snap <snapshot-dir> --live <watched-dir>");
