@@ -310,6 +310,75 @@ mod tests {
         assert!(t.unpersisted_chain(10).len() <= MAX_CHAIN);
     }
 
+    /// Drives the tree at the fork rate actually measured on this machine
+    /// for a simulated hour, to check the memory bound is a property of the
+    /// design and not just an argument.
+    ///
+    /// Simulated rather than real because the claim is about the eviction
+    /// arithmetic, which is deterministic: 16.8 forks/second against a 90
+    /// second grace should settle near 16.8 * 90 ≈ 1500 retained-but-dead
+    /// entries, plus whatever is genuinely alive. A real hour of wall clock
+    /// would test the kernel, not this.
+    #[test]
+    fn tree_stays_bounded_at_the_measured_fork_rate() {
+        use chrono::{Duration, TimeZone, Utc};
+
+        const FORKS_PER_SEC: i32 = 17; // measured: 16.8/s at idle
+        const GRACE: i64 = 90;
+        const HOURS: i64 = 1;
+
+        let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let ts = |secs: i64| {
+            (base + Duration::seconds(secs))
+                .format("%Y-%m-%dT%H-%M-%S")
+                .to_string()
+        };
+
+        let mut t = ProcTree::new();
+        // A few hundred long-lived processes, as on any real desktop.
+        for pid in 0..400 {
+            t.seed(pid, Some(1), info("daemon"), &ts(0));
+        }
+
+        let mut next_pid = 1000;
+        let mut peak = 0usize;
+        let total_secs = HOURS * 3600;
+        for sec in 0..total_secs {
+            let now = ts(sec);
+            let mut born = Vec::new();
+            for _ in 0..FORKS_PER_SEC {
+                t.on_fork(1, next_pid, &now);
+                t.on_exec(next_pid, info("sh"), None, &now);
+                born.push(next_pid);
+                next_pid += 1;
+            }
+            // Short-lived: they exit in the same second they were born,
+            // which is what the overwhelming majority of forks do.
+            for pid in born {
+                t.on_exit(pid, &now);
+            }
+            if sec % 30 == 0 {
+                t.evict_stale(&ts(sec - GRACE));
+            }
+            peak = peak.max(t.len());
+        }
+        t.evict_stale(&ts(total_secs - GRACE));
+
+        let expected = 400 + (FORKS_PER_SEC as i64 * (GRACE + 30)) as usize;
+        assert!(
+            peak <= expected,
+            "peak {peak} exceeded the {expected} implied by rate x (grace + evict interval)"
+        );
+        // The real claim: an hour of churn leaves no residue. 61k forks in,
+        // and what remains is the live set plus one grace window.
+        assert!(
+            t.len() < 3_000,
+            "after {total_secs}s and {} forks, {} entries remain — not bounded",
+            total_secs * FORKS_PER_SEC as i64,
+            t.len()
+        );
+    }
+
     #[test]
     fn eviction_removes_only_processes_that_exited_before_the_cutoff() {
         let mut t = ProcTree::new();
