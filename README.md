@@ -104,6 +104,19 @@ the command began, not to some intermediate value the command produced.
 Re-applying is safe — a file already removed is the desired end state, not
 an error.
 
+**Renames need no special handling.** `mv a b` emits `moved_from(a)` and
+`moved_to(b)`. Nothing in the planner knows what a rename is, and it does
+not need to: `a` existed before the command so it is restored, `b` did not
+so it is removed, and the pair reconstitutes the original state. fanotify's
+missing rename cookie is a problem for *describing* the change, never for
+reversing it.
+
+**Undo granularity is bounded by snapshot cadence.** The pre-image is the
+newest snapshot *predating* the command — so anything changed after the
+last snapshot but before the command is rolled back along with the
+command's own work. Take a snapshot immediately before tracing if the
+boundary needs to be exact rather than "within the last five minutes".
+
 Removals run deepest-first, because a command that ran `mkdir -p a/b`
 produces create events with the parent listed first, and `a` cannot be
 removed before `a/b`. Directories are removed with `remove_dir`, never
@@ -243,7 +256,10 @@ Correctness properties covered by tests (`cargo test --lib`):
   dominated by the feedback loop above, so it says nothing useful yet.
 - **No rename-cookie correlation.** fanotify doesn't pair `FAN_MOVED_FROM`
   with its matching `FAN_MOVED_TO` the way inotify does; each is logged as
-  an independent event rather than one "renamed X to Y" record.
+  an independent event rather than one "renamed X to Y" record. This
+  affects *describing* a change, not undoing one — see below. (`FAN_RENAME`
+  on Linux 5.17+ reports both halves in a single event and would fix the
+  description; not implemented.)
 - **Proc-connector narrows the exit race, doesn't close it.** Live-verified
   in both directions on the same run: a real `mv`'s identity, empty before
   the connector existed, is now fully captured including complete cmdline.

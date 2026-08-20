@@ -180,10 +180,14 @@ mod tests {
     use super::*;
 
     fn ev(path: &str, ts: &str) -> FileEvent {
+        ev_op(path, ts, "create")
+    }
+
+    fn ev_op(path: &str, ts: &str, op: &str) -> FileEvent {
         FileEvent {
             ts: ts.into(),
             path: path.into(),
-            op: "create".into(),
+            op: op.into(),
             pid: 1,
             comm: "sh".into(),
             exe: String::new(),
@@ -329,6 +333,59 @@ mod tests {
             &live,
         );
         assert!(matches!(steps[0], Step::Restore { .. }), "{:?}", steps);
+    }
+
+    #[test]
+    fn a_rename_is_undone_by_the_content_model_without_special_casing() {
+        // `mv a b` emits moved_from(a) and moved_to(b). Nothing here knows
+        // what a rename is, and it does not need to: the pre-image decides.
+        // `a` existed before the command, so it is restored; `b` did not, so
+        // it is removed. The pair reconstitutes the original state, which is
+        // why fanotify's missing rename cookie is not a correctness problem
+        // for undo -- only for *describing* the change as a rename.
+        let root = lab();
+        let (snap_root, live) = (root.join("snap"), root.join("live"));
+        let snap = snap_root.join("2026-01-01T00-00-00");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("a.conf"), "original").unwrap();
+
+        let steps = plan(
+            &[
+                ev_op(
+                    &format!("{}/a.conf", live.display()),
+                    "2026-01-02T00-00-00",
+                    "moved_from",
+                ),
+                ev_op(
+                    &format!("{}/b.conf", live.display()),
+                    "2026-01-02T00-00-00",
+                    "moved_to",
+                ),
+            ],
+            &["2026-01-01T00-00-00".into()],
+            &snap_root,
+            &live,
+        );
+
+        let restored: Vec<_> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Restore { path, .. } => Some(path.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+        let removed: Vec<_> = steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Remove { path } => Some(path.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(restored.len(), 1, "the source must come back: {steps:?}");
+        assert!(restored[0].ends_with("a.conf"));
+        assert_eq!(removed.len(), 1, "the destination must go: {steps:?}");
+        assert!(removed[0].ends_with("b.conf"));
     }
 
     #[test]

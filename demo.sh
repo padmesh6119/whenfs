@@ -225,6 +225,9 @@ if [ "$RUNNING_AS_ROOT" -eq 1 ]; then
 mkdir -p "$1/opt/thing"
 echo "binary"  > "$1/opt/thing/thing"
 echo "cfg"     > "$1/etc-thing.conf"
+# Modify a file that existed before this ran, so the undo has to RESTORE
+# rather than just delete -- every prior demo only ever exercised removal.
+echo "# LINE ADDED BY INSTALLER" >> "$1/nginx.conf"
 sh -c "echo 'from a grandchild' > '$1/nested.conf'"
 cp "$1/etc-thing.conf" "$1/etc-thing.conf.bak"
 rm -f "$1/etc-thing.conf.bak"
@@ -238,6 +241,19 @@ INSTALLER
         echo "#   by lineage. Unrelated writes elsewhere on the machine"
         echo "#   must NOT appear."
         echo "############################################################"
+        # Snapshot immediately before tracing. The pre-image an undo
+        # restores from is the newest snapshot PREDATING the command, so
+        # anything changed after the last snapshot but before the command
+        # would otherwise be rolled back too -- undo granularity is bounded
+        # by snapshot cadence, and taking one here is what makes the
+        # boundary exact rather than "within the last five minutes".
+        SNAPSHOT_MODE=full "$DIR/snapshot.sh" "$LAB/live" "$LAB/snap" >/dev/null
+        sleep 1.1
+
+        echo
+        echo "== nginx.conf before the installer runs =="
+        cat "$LAB/live/nginx.conf"
+
         TRACE_OUT="$("$BIN/chronicle" --db "$GRAPH" trace -- sh "$LAB/fake-install.sh" "$LAB/live" 2>&1)"
         echo "$TRACE_OUT"
         TPID="$(printf '%s' "$TRACE_OUT" | grep -oE 'pid [0-9]+' | head -1 | awk '{print $2}')"
@@ -269,6 +285,10 @@ INSTALLER
             echo "== after undo: the installer's files should be gone, =="
             echo "==            nginx.conf should still be here        =="
             ls "$LAB/live" 2>/dev/null
+            echo
+            echo "== nginx.conf after undo — the appended line must be gone, =="
+            echo "==   which is a RESTORE from snapshot, not a deletion      =="
+            cat "$LAB/live/nginx.conf"
         else
             echo "could not determine traced pid — skipping revert"
         fi
